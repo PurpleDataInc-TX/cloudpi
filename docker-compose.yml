@@ -1,0 +1,88 @@
+version: "3.8"
+ 
+services:
+  db:
+    image: cloudpi1/cloudpi:dbversion_0.0.2
+    container_name: cloudpi-db
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    restart: always
+    networks:
+      - cloudpi-network
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$MYSQL_USER -p$MYSQL_PASSWORD  || exit 1"]
+      interval: 10s
+      timeout: 20s
+      retries: 10
+      start_period: 90s  # ⬅️ Increased from 50s to 90s
+
+
+
+    env_file:
+      - .env
+ 
+  app:
+    image: cloudpi1/cloudpi:beta_1.0.0
+    container_name: cloudpi-app
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "5005:5005"  # Flask API
+      - "5001:5001"  # Backend API
+      - "3000:3000"  # Frontend
+      - "6379:6379"  # Redis
+      - "8088:8088"  # Superset
+    networks:
+      - cloudpi-network
+   
+    env_file:
+      - .env
+    command: >
+      /bin/bash -c "
+      echo 'Waiting for MySQL and the target database ($MYSQL_DATABASE) to be fully ready...' ;
+      until mysql -h $DB_HOST -u$MYSQL_USER -p$MYSQL_PASSWORD -e 'USE $MYSQL_DATABASE' > /dev/null 2>&1; do
+          echo 'Database $MYSQL_DATABASE is not ready yet...'
+          sleep 5
+      done;
+      echo 'MySQL and the database are ready, starting application...' ;
+      sed -i 's|.*:5001|$NODEJS_HOST:$NODEJS_PORT|g' /app/backend/.env &&
+      sed -i 's|DB_HOST=.*|DB_HOST=$DB_HOST|g' /app/backend/.env &&
+      sed -i 's|http://.*:5005|http://$FLASK_HOST:$FLASK_PORT|g' /app/backend/.env &&
+      sed -i 's|REDIS_HOST=.*|REDIS_HOST=$REDIS_HOST|g' /app/backend/.env &&
+      sed -i 's|http://.*:8088|http://$SUPERSET_HOST:$SUPERSET_PORT|g' /app/backend/.env &&
+      sed -i \"s|new_uri = 'mysql+pymysql://.*:.*/.*'|new_uri = 'mysql+pymysql://$MYSQL_USER:$MYSQL_PASSWORD@$DB_HOST:$DB_PORT/$MYSQL_DATABASE'|g\" /app/superset/update_dbconn.py &&
+      sed -i \"s|SUPERTSET_URL = 'http://TARGET_IP:8088'|SUPERTSET_URL = 'http://$SUPERSET_HOST:$SUPERSET_PORT'|g\" /app/superset/update_dbconn.py &&
+      sed -i 's|mysql+pymysql://.*:.*@.*/.*|mysql+pymysql://$MYSQL_USER:$MYSQL_PASSWORD@$DB_HOST:$DB_PORT/$MYSQL_DATABASE|g' /app/Flask/pico/.env &&
+      sed -i 's|mysql+pymysql://.*:.*@.*:.*/.*|mysql+pymysql://$MYSQL_USER:$MYSQL_PASSWORD@$DB_HOST:$DB_PORT/$MYSQL_DATABASE|g' /app/Flask/pico/.env &&
+      sed -i 's|NODEJS_LINK=.*|NODEJS_LINK=$NODEJS_HOST:$NODEJS_PORT|g' /app/Flask/pico/.env &&
+      sed -i 's|http://.*:5005|http://$FLASK_HOST:$FLASK_PORT|g' /app/frontend/.env &&
+      sed -i 's|REACT_APP_ORIGIN_URL=.*|REACT_APP_ORIGIN_URL=http://$FRONTEND_HOST:3000|g' /app/backend/.env &&
+      sed -i 's/^bind .*/bind 0.0.0.0/' /etc/redis/redis.conf &&
+      sed -i \"s|REACT_APP_API_URL: 'http://[^']*'|REACT_APP_API_URL: 'http://$FRONTEND_HOST:5001/'|g\" /app/frontend/build/env.js &&
+      sed -i \"s|REACT_APP_FLASK_URL: 'http://[^']*'|REACT_APP_FLASK_URL: 'http://$FRONTEND_HOST:5005'|g\" /app/frontend/build/env.js &&
+
+      redis-server /etc/redis/redis.conf &
+      cd /app/backend && pm2 start dist/app.js --name CloudPi-Node &&
+      cd /app/frontend && pm2 start http-server --name CloudPi-FE2.0 -- build -p 3000 &&
+      cd /app/Flask/pico && pm2 start ./dist/app --name my-flask-app  &&
+      . /app/superset/superset_env/bin/activate &&
+      SUPerset_CONFIG=debug pm2-runtime start 'gunicorn -w 4 -b 0.0.0.0:8088 \"superset.app:create_app()\"' --name "superset-server"  &
+      sleep 10 &&
+      cd /app/superset && python3 update_dbconn.py ;
+ 
+      pm2 delete superset-server && SUPerset_CONFIG=debug pm2-runtime start 'gunicorn -w 4 -b 0.0.0.0:8088 \"superset.app:create_app()\"' --name "superset-server"  
+     
+ 
+      "
+     
+ 
+volumes:
+  mysql_data:
+ 
+networks:
+  cloudpi-network:
+    driver: bridge
