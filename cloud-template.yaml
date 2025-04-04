@@ -7,17 +7,17 @@ Parameters:
   # Required Parameters (no defaults)
   AMIID:
     Type: String
-    Default: ami-0b22d2f94e1cffc40
+    Default: ''
     Description: REQUIRED - AMI ID for EC2 instance
 
   InstanceType:
     Type: String
-    Default: t2.2xlarge
+    Default: ''
     Description: REQUIRED - EC2 instance type
 
   KeyName:
     Type: String
-    Default: cloudpi_private_key_202412210351.pem
+    Default: ''
     Description: REQUIRED - EC2 key pair name
 
   HTTPSEnabled:
