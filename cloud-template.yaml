@@ -1,0 +1,249 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for launching a CloudPi AMI with dynamic
+  subdomain naming.
+
+
+Parameters:
+  # Required Parameters (no defaults)
+  AMIID:
+    Type: String
+    Default: ami-0b22d2f94e1cffc40
+    Description: REQUIRED - AMI ID for EC2 instance
+
+  InstanceType:
+    Type: String
+    Default: t2.2xlarge
+    Description: REQUIRED - EC2 instance type
+
+  KeyName:
+    Type: String
+    Default: cloudpi_private_key_202412210351.pem
+    Description: REQUIRED - EC2 key pair name
+
+  HTTPSEnabled:
+    Type: String
+    AllowedValues: ['True', 'False']
+    Description: REQUIRED - Enable HTTPS/subdomain (true/false)
+
+  # Optional Parameters (empty defaults)
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: OPTIONAL - Route53 Hosted Zone ID (required if HTTPS=true)
+
+  DomainName:
+    Type: String
+    Default: ''
+    Description: OPTIONAL - Base domain name (required if HTTPS=true)
+
+Conditions:
+  CreateSubdomain: !And 
+    - !Equals [!Ref HTTPSEnabled, 'true']
+    - !Not [!Equals [!Ref HostedZoneId, '']]
+    - !Not [!Equals [!Ref DomainName, '']]
+
+Resources:
+
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: CloudPiVPC
+
+  # Subnet 1 (Public)
+  Subnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+
+  # Subnet 2 (Public)
+  Subnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: CloudPiInternetGateway
+
+  # Attach Internet Gateway to VPC
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Route Table
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: CloudPiRouteTable
+
+  # Route to Internet (0.0.0.0/0)
+  Route:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Subnet 1 Route Table Association
+  Subnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet1
+      RouteTableId: !Ref RouteTable
+
+  # Subnet 2 Route Table Association
+  Subnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet2
+      RouteTableId: !Ref RouteTable
+
+  # Security Group for EC2 Instance
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH, HTTP, HTTPS, MySQL, Apache Superset, Flask
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0 # Open to all IPs (consider restricting to your IP)
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0 # Open to all IPs (consider restricting to your MySQL server IP)
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5001
+          ToPort: 5001
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 587
+          ToPort: 587
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5005
+          ToPort: 5005
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8088
+          ToPort: 8088
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          CidrIp: 0.0.0.0/0
+
+  # Elastic IP Allocation
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      InstanceId: !Ref EC2Instance
+
+  SubdomainRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateSubdomain
+    Properties:
+      HostedZoneId: !If [CreateSubdomain, !Ref HostedZoneId, !Ref 'AWS::NoValue']
+      Name: !If 
+        - CreateSubdomain
+        - !Sub "client${EC2Instance.PublicIp}.${DomainName}"
+        - !Ref 'AWS::NoValue'
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt ElasticIP.PublicIp
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: AttachGateway
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: !Ref AMIID
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: 'true'
+          DeviceIndex: 0
+          SubnetId: !Ref Subnet1
+          GroupSet:
+            - !Ref InstanceSecurityGroup
+      UserData:
+        "Fn::Base64": !Sub |
+          #!/bin/bash
+          export HOME=/home/ec2-user
+      
+          # Ensure PM2 is installed
+          if ! command -v pm2 &> /dev/null; then
+              npm install -g pm2
+          fi
+      
+          # Set proper ownership for PM2 socket files
+          if [ -S /home/ec2-user/.pm2/rpc.sock ] && [ -S /home/ec2-user/.pm2/pub.sock ]; then
+              sudo chown ec2-user:ec2-user /home/ec2-user/.pm2/rpc.sock /home/ec2-user/.pm2/pub.sock
+          fi
+      
+          # Ensure the script exists and is executable
+          if [ ! -f /home/ec2-user/cloud_restart.sh ]; then
+              echo "/home/ec2-user/cloud_restart.sh not found."
+              exit 1
+          fi
+      
+          chmod +x /home/ec2-user/cloud_restart.sh
+          sudo chown ec2-user:ec2-user /home/ec2-user/cloud_restart.sh
+      
+          # Execute the app restart logic
+          /home/ec2-user/cloud_restart.sh
+      
+          # Save current PM2 process list for future restarts
+          pm2 save
+      
+          # Restart PM2 to ensure saved apps come up on reboot
+          pm2 startup systemd -u ec2-user --hp /home/ec2-user
+          sudo env PATH=$PATH:/home/ec2-user/.nvm/versions/node/*/bin pm2 startup systemd -u ec2-user --hp /home/ec2-user"
+
+
+Outputs:
+  EC2InstancePublicIP:
+    Description: Public IP of the CloudPi EC2 instance
+    Value: !GetAtt EC2Instance.PublicIp
+
+
+
+
