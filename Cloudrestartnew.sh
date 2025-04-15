@@ -1,7 +1,7 @@
 #!/bin/bash
 # Get public IP and convert HTTPS flag to lowercase
 public_ip=$(curl -s http://checkip.amazonaws.com)
-use_https=true
+use_https=false
 SUBDOMAIN=cloudpie.ai
 # Determine protocol and host
 if [[ "$use_https" == "true" && -n "$SUBDOMAIN" ]]; then
