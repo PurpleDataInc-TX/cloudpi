@@ -3,8 +3,6 @@ services:
   db:
     image: cloudpi1/cloudpi:Cloudpi_db_v1.0.179
     container_name: cloudpi-db
-    ports:
-      - 3306:3306
     volumes:
     - mysql_data:/var/lib/mysql
     restart: always
@@ -12,8 +10,10 @@ services:
     - cloudpi-network
     healthcheck:
       test:
-      - CMD-SHELL
-      - mysqladmin ping -h cloudpi-db  -uadmin -pAWSGCPPI_2k23  || exit 1
+        [
+          "CMD-SHELL",
+          "mysqladmin ping -h localhost || exit 1",
+        ]
       interval: 10s
       timeout: 20s
       retries: 10
@@ -34,10 +34,6 @@ services:
       retries: 5
       start_period: 30s
     ports:
-    - 6379:6379
-    - 3000:3000
-    - 5005:5005
-    - 5001:5001
     - 443:443
     - 80:80
     networks:
