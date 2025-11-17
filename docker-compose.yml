@@ -1,13 +1,14 @@
-version: '3.8'
+version: "3.8"
 services:
   db:
-    image: cloudpi1/cloudpi:Cloudpi_db_v1.0.179
+    image: cloudpi1/cloudpi:Cloudpi_db_v1.0.201
+
     container_name: cloudpi-db
     volumes:
-    - mysql_data:/var/lib/mysql
+      - mysql_data:/var/lib/mysql
     restart: always
     networks:
-    - cloudpi-network
+      - cloudpi-network
     healthcheck:
       test:
         [
@@ -17,38 +18,37 @@ services:
       interval: 10s
       timeout: 20s
       retries: 10
-      start_period: 90s
+      start_period: 90s 
+
     env_file:
-    - .env
+      - .env
   app:
-    image: cloudpi1/cloudpi:Cloudpi_v1.0.179
+    image: cloudpi1/cloudpi:Cloudpi_v1.0.201
     container_name: cloudpi-app
     restart: always
     depends_on:
       db:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost/CPiN/monitor"]
+      test: ["CMD-SHELL", "curl -f http://localhost/CPiP/v1/health && curl -f http://localhost/CPiN/monitor"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 30s
     ports:
-    - 443:443
-    - 80:80
+      - "443:443" # HTTPS
+      - "80:80" # HTTP
     networks:
-    - cloudpi-network
+      - cloudpi-network
     env_file:
-    - .env
+      - .env
     environment:
       HOST: ${HOST:-localhost}
       LOCALSTACK_ENDPOINT: ${LOCALSTACK_ENDPOINT}
     volumes:
-    - redis_data:/var/lib/redis
-    - ./certs:/home/certs/
-    command:
-    - /bin/bash
-    - /app/entrypoint.sh
+      - redis_data:/var/lib/redis
+      - ./certs:/home/certs/
+
 volumes:
   mysql_data:
   redis_data:
