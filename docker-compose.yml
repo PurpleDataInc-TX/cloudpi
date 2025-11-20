@@ -1,8 +1,7 @@
 version: "3.8"
 services:
   db:
-    image: cloudpi1/cloudpi:Cloudpi_db_v1.0.201
-
+    image: cloudpi1/cloudpi:Cloudpi_db_v1.0.204
     container_name: cloudpi-db
     volumes:
       - mysql_data:/var/lib/mysql
@@ -22,8 +21,18 @@ services:
 
     env_file:
       - .env
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+
   app:
-    image: cloudpi1/cloudpi:Cloudpi_v1.0.201
+    image: cloudpi1/cloudpi:Cloudpi_v1.0.204
     container_name: cloudpi-app
     restart: always
     depends_on:
@@ -47,11 +56,21 @@ services:
       LOCALSTACK_ENDPOINT: ${LOCALSTACK_ENDPOINT}
     volumes:
       - redis_data:/var/lib/redis
-      - ./certs:/home/certs/
+      - ./certs:/home/certs
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   mysql_data:
+    driver: local
   redis_data:
+    driver: local
+
 networks:
   cloudpi-network:
     driver: bridge
+    # SECURITY: Enable network isolation
+    internal: false  # Set to true if no external access needed
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
