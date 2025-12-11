@@ -18,7 +18,6 @@ CloudPi provides cloud cost governance and build tooling to help deploy scalable
 - `.env`: Example environment setup.
 - `CloudPi Platform Deployment Guide.docx`: End-to-end deployment guide.
 - `Run Docker Compose on EC2 instance.docx`: Step-by-step guide for deploying on AWS EC2.
-- `cloudformation template launch documentation.docx`: Instructions for using AWS CloudFormation.
 
 ## Getting Started
 
