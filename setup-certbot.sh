@@ -89,9 +89,8 @@ validate_domain() {
 collect_input() {
     print_header "CloudPi Certificate Configuration"
 
-    # Auto-detect VM hostname
+    # Auto-detect VM hostname (no default domain suffix - user must provide full domain)
     VM_HOSTNAME=$(hostname)
-    SUGGESTED_SUBDOMAIN="${VM_HOSTNAME}.nichesoft.ai"
 
     # Auto-detect public IP
     print_info "Detecting public IP address..."
@@ -105,13 +104,13 @@ collect_input() {
     fi
     echo ""
 
-    # Subdomain
+    # Subdomain/Domain
     while true; do
-        if [[ -n "$SUGGESTED_SUBDOMAIN" ]]; then
-            read -p "Enter your subdomain [default: $SUGGESTED_SUBDOMAIN]: " SUBDOMAIN
-            SUBDOMAIN=${SUBDOMAIN:-$SUGGESTED_SUBDOMAIN}
-        else
-            read -p "Enter your subdomain (e.g., cloudpit13.nichesoft.ai): " SUBDOMAIN
+        read -p "Enter your domain (e.g., demo.example.com): " SUBDOMAIN
+
+        if [[ -z "$SUBDOMAIN" ]]; then
+            print_error "Domain is required. Please enter a valid domain."
+            continue
         fi
 
         if validate_domain "$SUBDOMAIN"; then
