@@ -38,7 +38,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1'
+          cpus: '6'
           memory: 4G
 
   app:
@@ -69,18 +69,21 @@ services:
     volumes:
       - redis_data:/var/lib/redis
       - ./certs:/home/certs
+      - cloudpi:/app/backups
     security_opt:
       - no-new-privileges:true
     deploy:
       resources:
         limits:
-          cpus: '1'
-          memory: 4G
+          cpus: '6'
+          memory: 6G
 
 volumes:
   mysql_data:
     driver: local
   redis_data:
+    driver: local
+  cloudpi:
     driver: local
 
 networks:
