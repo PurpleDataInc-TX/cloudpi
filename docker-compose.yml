@@ -66,6 +66,8 @@ services:
       - .env
     environment:
       HOST: ${HOST:-localhost}
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
     volumes:
       - redis_data:/var/lib/redis
       - ./certs:/home/certs
