@@ -59,6 +59,13 @@ DOCKER_REPOSITORY="cloudpi1/cloudpi"
 BACKUP_DIR="${SCRIPT_DIR}/backups"
 DEPLOY_IN_PROGRESS=false
 
+# Compose project name (used to prefix volume names for unambiguous resolution).
+# Priority: COMPOSE_PROJECT_NAME env > docker compose config > directory name fallback.
+COMPOSE_PROJECT=""
+if [ -n "${COMPOSE_PROJECT_NAME:-}" ]; then
+    COMPOSE_PROJECT="$COMPOSE_PROJECT_NAME"
+fi
+
 # Timeouts
 MIGRATION_TIMEOUT="${MIGRATION_TIMEOUT:-300}"  # 5 minutes max for migrations
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-120}"         # 2 minutes for health check after migrations
@@ -167,24 +174,31 @@ trap 'handle_signal "interrupt (Ctrl+C)" 130' INT
 trap 'handle_signal "termination" 143' TERM
 trap 'handle_signal "terminal disconnect (HUP)" 129' HUP
 
-# Detect if Docker needs sudo
-# NOTE: IFS=$'\n\t' (line 31) strips space from word-splitting, so variables like
-# "sudo docker" won't split into two words. We use functions instead of variables
-# for command execution to avoid this issue.
-NEEDS_SUDO=false
+# ============================================================
+# Privilege Detection
+# ============================================================
+# Two separate concerns:
+#   1. NEEDS_DOCKER_SUDO — can we run "docker" commands directly?
+#   2. NEEDS_FS_SUDO     — can we read/write Docker volume directories?
+#
+# These differ when the user is in the "docker" group (Docker works without
+# sudo) but volume files are owned by container UIDs (e.g., mysql UID 27/999)
+# that the host user cannot read without sudo.
+NEEDS_DOCKER_SUDO=false
+NEEDS_FS_SUDO=false
 
 if docker info >/dev/null 2>&1; then
     run_docker() { docker "$@"; }
 else
     # Check if sudo works without a password (NOPASSWD or cached)
     if sudo -n docker info >/dev/null 2>&1; then
-        NEEDS_SUDO=true
+        NEEDS_DOCKER_SUDO=true
     else
         # Sudo needs a password — ask the user explicitly
         echo "Docker requires sudo privileges on this system."
         echo "Please enter your password to continue:"
         if sudo docker info >/dev/null 2>&1; then
-            NEEDS_SUDO=true
+            NEEDS_DOCKER_SUDO=true
         else
             echo "Error: Cannot access Docker. Add your user to the 'docker' group or check sudo permissions." >&2
             exit 1
@@ -198,13 +212,72 @@ else
         fi
         sudo docker "$@"
     }
+fi
 
-    # Keep sudo credentials alive in the background (refreshes every 50s).
-    # Detects when sudo credentials expire and writes a marker file.
+# Probe filesystem access to actual Docker volume mountpoints.
+# Docker volume data directories (e.g., mysql_data/_data) are owned by
+# container-internal UIDs (mysql=27/999, redis=999, etc.) and are often
+# not readable by the host user even when the parent volumes/ dir is listable.
+# This function probes the actual volume mountpoint — not just the parent dir —
+# to correctly detect whether sudo is needed for tar/du/rm operations.
+detect_fs_sudo() {
+    local probe_path=""
+
+    # Strategy 1: Inspect the DB container's /var/lib/mysql mount source.
+    # This is the most accurate — it resolves named volumes, bind-mounts, and
+    # external drivers, and is scoped to the correct Compose project's container.
+    probe_path=$(run_docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/mysql"}}{{.Source}}{{end}}{{end}}' "$DB_CONTAINER" 2>/dev/null || echo "")
+
+    # Strategy 2: Find the named volume directly (container may not exist yet on --init)
+    if [ -z "$probe_path" ]; then
+        local db_vol_name
+        db_vol_name=$(run_docker volume ls -q --filter "name=mysql_data" 2>/dev/null | grep -E "mysql_data$" | head -1)
+        if [ -n "$db_vol_name" ]; then
+            probe_path=$(run_docker volume inspect -f '{{.Mountpoint}}' "$db_vol_name" 2>/dev/null || echo "")
+        fi
+    fi
+
+    # Strategy 3: Probe Docker root volumes dir (last resort — less accurate)
+    if [ -z "$probe_path" ]; then
+        local docker_root
+        docker_root=$(run_docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo "/var/lib/docker")
+        probe_path="${docker_root}/volumes"
+    fi
+
+    if test -r "$probe_path" 2>/dev/null && ls "$probe_path" >/dev/null 2>&1; then
+        # Can read volume directory — no sudo needed for filesystem ops
+        NEEDS_FS_SUDO=false
+    elif sudo -n test -r "$probe_path" 2>/dev/null; then
+        NEEDS_FS_SUDO=true
+    elif sudo test -r "$probe_path" 2>/dev/null; then
+        NEEDS_FS_SUDO=true
+    else
+        echo "Error: Cannot access Docker volume path: $probe_path" >&2
+        echo "Run with sudo or fix directory permissions." >&2
+        exit 1
+    fi
+}
+
+# Only probe filesystem sudo for mutating commands that touch volumes.
+# Read-only commands (--status, --history, --help) don't need volume access.
+case "${1:-}" in
+    --status|-s|--history|-H|--help|-h|"")
+        # No FS sudo detection needed for read-only operations
+        ;;
+    *)
+        detect_fs_sudo
+        ;;
+esac
+
+# Start sudo keepalive if ANY operation requires sudo.
+# Uses sudo -v (validate) which refreshes credentials without running a command.
+# This is more portable than sudo -n true which may be blocked by restrictive
+# sudoers configs that only allow NOPASSWD for specific commands.
+if [ "$NEEDS_DOCKER_SUDO" = true ] || [ "$NEEDS_FS_SUDO" = true ]; then
     SUDO_EXPIRED_MARKER="${SCRIPT_DIR}/.sudo_expired"
     rm -f "$SUDO_EXPIRED_MARKER"
     ( while true; do
-        if ! sudo -n true 2>/dev/null; then
+        if ! sudo -n -v 2>/dev/null; then
             touch "$SUDO_EXPIRED_MARKER" 2>/dev/null
             break
         fi
@@ -213,16 +286,16 @@ else
     SUDO_PID=$!
 fi
 
-# Helper: run a command with sudo if Docker requires it.
-# Checks sudo health before execution to provide clear error messages.
+# Helper: run a filesystem command with sudo when volume paths aren't readable.
+# Used for tar, du, chmod, rm on Docker volume directories.
 run_maybe_sudo() {
-    if [ "$NEEDS_SUDO" = true ]; then
+    if [ "$NEEDS_FS_SUDO" = true ]; then
         if [ -f "${SUDO_EXPIRED_MARKER:-}" ]; then
             echo -e "\033[0;31m[ERROR]\033[0m sudo credentials have expired during operation" >&2
             echo -e "\033[0;31m[ERROR]\033[0m Re-run the script or refresh with: sudo -v" >&2
             return 1
         fi
-        if ! sudo -n true 2>/dev/null; then
+        if ! sudo -n -v 2>/dev/null; then
             echo -e "\033[0;31m[ERROR]\033[0m sudo authentication failed — credentials may have expired" >&2
             echo -e "\033[0;31m[ERROR]\033[0m Re-run the script or refresh with: sudo -v" >&2
             return 1
@@ -238,7 +311,7 @@ if run_docker compose version >/dev/null 2>&1; then
     run_compose() { run_docker compose "$@"; }
 elif command -v docker-compose >/dev/null 2>&1; then
     # docker-compose is a standalone binary, needs sudo separately
-    if [ "$NEEDS_SUDO" = true ]; then
+    if [ "$NEEDS_DOCKER_SUDO" = true ]; then
         run_compose() {
             if [ -f "${SUDO_EXPIRED_MARKER:-}" ]; then
                 echo -e "\033[0;31m[ERROR]\033[0m sudo credentials have expired — re-run the script" >&2
@@ -252,6 +325,43 @@ elif command -v docker-compose >/dev/null 2>&1; then
 else
     echo "Error: Docker Compose not found (neither 'docker compose' nor 'docker-compose')" >&2
     exit 1
+fi
+
+# ============================================================
+# Compose Project Name Resolution (deferred until compose is available)
+# ============================================================
+resolve_compose_project() {
+    # Resolve once, cache the result
+    if [ -n "$COMPOSE_PROJECT" ]; then
+        return
+    fi
+    # Try docker compose config (outputs resolved 'name:' field — most accurate)
+    # --project-directory ensures .env is loaded from the compose file's directory
+    if [ -f "$COMPOSE_FILE" ]; then
+        local compose_dir
+        compose_dir="$(dirname "$COMPOSE_FILE")"
+        COMPOSE_PROJECT=$(run_compose --project-directory "$compose_dir" -f "$COMPOSE_FILE" config 2>/dev/null \
+            | sed -n 's/^name: *//p' | head -1 || echo "")
+    fi
+    # Fallback 1: check .env file for COMPOSE_PROJECT_NAME (covers docker-compose v1 and
+    # cases where `docker compose config` doesn't support --project-directory)
+    if [ -z "$COMPOSE_PROJECT" ] && [ -f "$COMPOSE_FILE" ]; then
+        local compose_dir
+        compose_dir="$(dirname "$COMPOSE_FILE")"
+        if [ -f "${compose_dir}/.env" ]; then
+            COMPOSE_PROJECT=$(grep -E '^\s*COMPOSE_PROJECT_NAME\s*=' "${compose_dir}/.env" 2>/dev/null \
+                | head -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*$//' | sed "s/^['\"]//; s/['\"]$//" || echo "")
+        fi
+    fi
+    # Fallback 2: derive from directory name (Docker Compose default behavior)
+    if [ -z "$COMPOSE_PROJECT" ]; then
+        COMPOSE_PROJECT="$(basename "$(dirname "$COMPOSE_FILE")" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')"
+    fi
+}
+resolve_compose_project
+# Export so all run_compose calls use the correct project regardless of cwd
+if [ -n "$COMPOSE_PROJECT" ]; then
+    export COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT"
 fi
 
 # ============================================================
@@ -374,6 +484,100 @@ clear_deploy_phase() {
     rm -f "$DEPLOY_PHASE_FILE" 2>/dev/null || true
 }
 
+check_interrupted_restore() {
+    # Detect orphaned .restore_bak / .restore_tmp from a crashed restore_volume operation.
+    # Called early to alert the operator before they start a new deploy/restore.
+    local journal_file="${BACKUP_DIR}/.restore_journal"
+    if [ ! -f "$journal_file" ]; then
+        return 0
+    fi
+
+    local j_label j_vol j_state
+    j_label=$(grep -o 'label=[^|]*' "$journal_file" 2>/dev/null | cut -d= -f2- || true)
+    j_vol=$(grep -o 'vol_path=[^|]*' "$journal_file" 2>/dev/null | cut -d= -f2- || true)
+    j_state=$(grep -o 'state=[^|]*' "$journal_file" 2>/dev/null | cut -d= -f2- || true)
+
+    echo ""
+    log_warn "=========================================="
+    log_warn "  INTERRUPTED VOLUME RESTORE DETECTED"
+    log_warn "=========================================="
+    log_warn "  Volume:   ${j_label:-unknown}"
+    log_warn "  Path:     ${j_vol:-unknown}"
+    log_warn "  State:    ${j_state:-unknown}"
+    log_warn "=========================================="
+
+    if [ -z "$j_vol" ]; then
+        log_warn "Restore journal has empty volume path — removing stale journal"
+        run_maybe_sudo rm -f "$journal_file" 2>/dev/null || true
+        return 0
+    fi
+
+    # Validate j_vol looks like a Docker volume mountpoint (safety against corrupted/tampered journal)
+    # Supports standard Docker (/var/lib/docker/volumes/), rootless (~/.local/share/docker/volumes/),
+    # and custom data-root configurations
+    if [[ "$j_vol" != */volumes/*/_data ]]; then
+        log_error "Journal vol_path '${j_vol}' does not look like a Docker volume mountpoint — refusing auto-recovery"
+        log_error "Remove the journal manually: ${journal_file}"
+        return 1
+    fi
+
+    # Check container state — warn if containers are running (data could be in use)
+    if is_container_running "$APP_CONTAINER" 2>/dev/null || is_container_running "$DB_CONTAINER" 2>/dev/null; then
+        log_warn "Containers are running — auto-recovery will stop them first"
+        if ! confirm_action "Stop containers to perform crash recovery?"; then
+            log_warn "Skipping auto-recovery — manual intervention may be needed"
+            return 0
+        fi
+        run_compose -f "$COMPOSE_FILE" stop 2>&1 || true
+        sleep 2
+        # Verify containers actually stopped before touching volume data
+        if is_container_running "$APP_CONTAINER" 2>/dev/null || is_container_running "$DB_CONTAINER" 2>/dev/null; then
+            log_warn "Containers still running after stop — escalating to docker kill"
+            run_docker kill "$APP_CONTAINER" 2>/dev/null || true
+            run_docker kill "$DB_CONTAINER" 2>/dev/null || true
+            sleep 2
+            if is_container_running "$APP_CONTAINER" 2>/dev/null || is_container_running "$DB_CONTAINER" 2>/dev/null; then
+                log_error "Containers could not be stopped — skipping auto-recovery to prevent corruption"
+                return 1
+            fi
+        fi
+    fi
+
+    if [ -n "$j_vol" ]; then
+        if run_maybe_sudo test -d "${j_vol}.restore_bak" 2>/dev/null; then
+            if run_maybe_sudo test -d "$j_vol" 2>/dev/null; then
+                # New data in place, old data still as backup — restore succeeded, cleanup needed
+                log_info "Restored data appears in place. Cleaning up backup..."
+                run_maybe_sudo rm -rf "${j_vol}.restore_bak" 2>/dev/null || true
+                run_maybe_sudo rm -rf "${j_vol}.restore_tmp" 2>/dev/null || true
+                run_maybe_sudo rm -f "$journal_file" 2>/dev/null || true
+                log_ok "Cleanup complete"
+            else
+                # Vol path missing but backup exists — recover from backup
+                log_warn "Volume path missing but original backup exists — recovering..."
+                if run_maybe_sudo mv "${j_vol}.restore_bak" "$j_vol" 2>/dev/null; then
+                    log_ok "Original ${j_label} data recovered from backup"
+                else
+                    log_error "Failed to recover — manual intervention needed"
+                    log_error "Original data at: ${j_vol}.restore_bak"
+                fi
+                run_maybe_sudo rm -rf "${j_vol}.restore_tmp" 2>/dev/null || true
+                run_maybe_sudo rm -f "$journal_file" 2>/dev/null || true
+            fi
+        elif run_maybe_sudo test -d "${j_vol}.restore_tmp" 2>/dev/null; then
+            # Extraction was in progress — clean up temp
+            log_info "Incomplete extraction found — cleaning up..."
+            run_maybe_sudo rm -rf "${j_vol}.restore_tmp" 2>/dev/null || true
+            run_maybe_sudo rm -f "$journal_file" 2>/dev/null || true
+            log_ok "Cleanup complete — original data is intact"
+        else
+            # Journal exists but no orphaned dirs — just clean journal
+            run_maybe_sudo rm -f "$journal_file" 2>/dev/null || true
+        fi
+    fi
+    echo ""
+}
+
 check_interrupted_deploy() {
     # Called at the start of a new deploy to detect and warn about interrupted prior deploys
     local phase
@@ -470,10 +674,13 @@ _get_service_tag() {
     # Extract the services: section first, then find the named service block.
     # Service headers are at 2-space indent; their properties at 4+ spaces.
     # The range ends at the next 2-space key (next service) or top-level key or EOF.
+    # Escape DOCKER_REPOSITORY for safe use in grep/sed regex (handles dots, etc.)
+    local escaped_repo
+    escaped_repo=$(printf '%s' "$DOCKER_REPOSITORY" | sed 's/[.[\*^$()+?{|\\]/\\&/g')
     tag=$(sed -n '/^services:/,/^[a-z]/p' "$COMPOSE_FILE" 2>/dev/null | \
         sed -n "/^  ${service}:/,/^  [a-z]/p" | \
-        grep -m1 "image:.*${DOCKER_REPOSITORY}:" | \
-        sed "s|.*${DOCKER_REPOSITORY}:||" | sed 's/#.*//' | tr -d ' "'"'"'' || echo "")
+        grep -v '^\s*#' | grep -m1 "image:.*${escaped_repo}:" | \
+        sed "s|.*${escaped_repo}:||" | sed 's/#.*//' | tr -d ' "'"'"'' || echo "")
     echo "$tag"
 }
 
@@ -502,7 +709,8 @@ set_image_tag() {
     fi
     # Backup compose file before modification (auto-restore on failure)
     cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak"
-    sed -i "s|image: ${DOCKER_REPOSITORY}:${current_tag}|image: ${DOCKER_REPOSITORY}:${new_tag}|" "$COMPOSE_FILE"
+    # Scope replacement to the 'app:' service block only (prevents cross-service collision)
+    sed -i "/^  app:/,/^  [a-z]/ s|image: ${DOCKER_REPOSITORY}:${current_tag}|image: ${DOCKER_REPOSITORY}:${new_tag}|" "$COMPOSE_FILE"
     # Verify the replacement actually happened
     local verify_tag
     verify_tag=$(get_current_tag)
@@ -529,7 +737,8 @@ set_db_image_tag() {
     fi
     # Backup compose file before modification (auto-restore on failure)
     cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak"
-    sed -i "s|image: ${DOCKER_REPOSITORY}:${current_db_tag}|image: ${DOCKER_REPOSITORY}:${new_tag}|" "$COMPOSE_FILE"
+    # Scope replacement to the 'db:' service block only (prevents cross-service collision)
+    sed -i "/^  db:/,/^  [a-z]/ s|image: ${DOCKER_REPOSITORY}:${current_db_tag}|image: ${DOCKER_REPOSITORY}:${new_tag}|" "$COMPOSE_FILE"
     # Verify the replacement actually happened
     local verify_tag
     verify_tag=$(get_db_tag)
@@ -590,8 +799,11 @@ check_prerequisites() {
 
     # Docker (already detected above, just report)
     log_ok "Docker: $(run_docker --version | head -1)"
-    if [ "$NEEDS_SUDO" = true ]; then
+    if [ "$NEEDS_DOCKER_SUDO" = true ]; then
         log_info "Using sudo for Docker commands"
+    fi
+    if [ "$NEEDS_FS_SUDO" = true ]; then
+        log_info "Using sudo for volume filesystem operations (volume files owned by container UIDs)"
     fi
 
     # Docker Compose (already detected above, just report)
@@ -612,11 +824,21 @@ check_prerequisites() {
         log_ok "Environment file: $ENV_FILE"
     fi
 
-    # Secrets file
-    if [ ! -f "${SCRIPT_DIR}/cloudpi.secrets" ]; then
-        log_warn "cloudpi.secrets not found — compose may fail"
+    # Secrets file — resolve path from docker compose config (handles env vars, anchors, etc.)
+    local secrets_path=""
+    if [ -f "$COMPOSE_FILE" ]; then
+        # docker compose config outputs fully resolved YAML with absolute paths
+        secrets_path=$(run_compose -f "$COMPOSE_FILE" config 2>/dev/null \
+            | sed -n '/^secrets:/,/^[a-z]/{ /file:/{ s/.*file: *//; s/ *$//; p; q; } }' || echo "")
+    fi
+    if [ -n "$secrets_path" ]; then
+        if [ ! -f "$secrets_path" ]; then
+            log_warn "Secrets file not found: $secrets_path (resolved from $COMPOSE_FILE)"
+        else
+            log_ok "Secrets file: $secrets_path"
+        fi
     else
-        log_ok "Secrets file: present"
+        log_warn "Could not resolve secrets file path from $COMPOSE_FILE — verify secrets config"
     fi
 
     if [ "$failed" = true ]; then
@@ -750,6 +972,19 @@ is_container_running() {
 stop_and_remove_app() {
     log_info "Stopping app container..."
     run_compose -f "$COMPOSE_FILE" stop app 2>&1 || true
+
+    # Verify container actually stopped (don't proceed with backup if still writing)
+    sleep 2
+    if is_container_running "$APP_CONTAINER"; then
+        log_warn "App container still running after stop — escalating to docker kill"
+        run_docker kill "$APP_CONTAINER" 2>/dev/null || true
+        sleep 2
+        if is_container_running "$APP_CONTAINER"; then
+            log_error "App container did not stop even after docker kill"
+            return 1
+        fi
+    fi
+
     run_compose -f "$COMPOSE_FILE" rm -f app 2>&1 || true
 }
 
@@ -865,14 +1100,28 @@ get_volume_path() {
     local vol_path
     vol_path=$(run_docker inspect -f "{{range .Mounts}}{{if eq .Destination \"${mount_dest}\"}}{{.Source}}{{end}}{{end}}" "$container" 2>/dev/null || echo "")
 
-    # Fallback: find the named volume directly
-    # Docker's --filter does substring matching, so "redis_data" also matches "redis_data_backup".
-    # Use grep with end-of-line anchor to pick only exact matches (e.g., dockerbuilds_redis_data).
-    # Note: volume_filter should NOT contain regex anchors like $ — Docker treats them literally.
+    # Fallback: find the named volume using compose project prefix for unambiguous matching.
+    # Docker Compose names volumes as {project}_{volume} (e.g., dockerbuilds_mysql_data).
+    # First try exact project-scoped match, then fall back to substring match.
     if [ -z "$vol_path" ]; then
-        local vol_name
+        local vol_name=""
         local docker_filter="${volume_filter%\$}"  # Strip trailing $ if present (Docker uses substring match)
-        vol_name=$(run_docker volume ls -q --filter "name=${docker_filter}" 2>/dev/null | grep -E "${docker_filter}\$" | head -1)
+        local escaped_filter
+        escaped_filter=$(printf '%s' "${docker_filter}" | sed 's/[.[\*^$()+?{|\\]/\\&/g')
+
+        # Try project-scoped exact match first (e.g., "dockerbuilds_mysql_data")
+        if [ -n "$COMPOSE_PROJECT" ]; then
+            local project_vol="${COMPOSE_PROJECT}_${docker_filter}"
+            vol_name=$(run_docker volume ls -q --filter "name=${project_vol}" 2>/dev/null \
+                | grep -Fx "$project_vol" | head -1 || true)
+        fi
+
+        # Fall back to escaped regex match (handles non-standard project names)
+        if [ -z "$vol_name" ]; then
+            vol_name=$(run_docker volume ls -q --filter "name=${docker_filter}" 2>/dev/null \
+                | grep -E "${escaped_filter}\$" | head -1 || true)
+        fi
+
         if [ -n "$vol_name" ]; then
             vol_path=$(run_docker volume inspect -f '{{.Mountpoint}}' "$vol_name" 2>/dev/null || echo "")
         fi
@@ -900,7 +1149,7 @@ backup_volume() {
     log_info "Backing up ${label} volume: $vol_path"
 
     # Pre-check sudo before multi-step backup operation
-    if [ "$NEEDS_SUDO" = true ] && ! sudo -n true 2>/dev/null; then
+    if [ "$NEEDS_FS_SUDO" = true ] && ! sudo -n -v 2>/dev/null; then
         log_error "sudo credentials expired before ${label} backup — re-run the script"
         return 1
     fi
@@ -988,7 +1237,7 @@ restore_volume() {
     log_info "Restoring ${label} volume from: $backup_file"
 
     # Pre-check sudo before multi-step restore operation
-    if [ "$NEEDS_SUDO" = true ] && ! sudo -n true 2>/dev/null; then
+    if [ "$NEEDS_FS_SUDO" = true ] && ! sudo -n -v 2>/dev/null; then
         log_error "sudo credentials expired before ${label} restore — re-run the script"
         return 1
     fi
@@ -1004,21 +1253,34 @@ restore_volume() {
 
     # Safety: extract to temp, then atomic swap preserving original until copy verified.
     # Original data is kept as .restore_bak until the new data is fully in place.
+    # A journal file tracks restore state for crash recovery.
     local temp_restore="${vol_path}.restore_tmp"
     local original_bak="${vol_path}.restore_bak"
+    local journal_file="${BACKUP_DIR}/.restore_journal"
+
+    # Write journal BEFORE any destructive action (for crash recovery)
+    run_maybe_sudo mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+    if ! printf '%s\n' "label=${label}|vol_path=${vol_path}|backup_file=${backup_file}|state=extracting|ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        | run_maybe_sudo tee "$journal_file" > /dev/null; then
+        log_warn "Could not write restore journal — crash recovery will not be available"
+    fi
 
     run_maybe_sudo rm -rf "$temp_restore" "$original_bak"
     run_maybe_sudo mkdir -p "$temp_restore"
     if ! run_maybe_sudo tar -xf "$backup_file" -C "$temp_restore"; then
         log_error "Tar extraction failed — original ${label} data is intact"
         run_maybe_sudo rm -rf "$temp_restore"
+        run_maybe_sudo rm -f "$journal_file" 2>/dev/null || true
         return 1
     fi
 
     # Move original data aside (preserves it until copy verified)
+    printf '%s\n' "label=${label}|vol_path=${vol_path}|backup_file=${backup_file}|state=swapping|ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        | run_maybe_sudo tee "$journal_file" > /dev/null 2>&1 || true
     if ! run_maybe_sudo mv "$vol_path" "$original_bak"; then
         log_error "Failed to move original ${label} data aside — aborting restore"
         run_maybe_sudo rm -rf "$temp_restore"
+        run_maybe_sudo rm -f "$journal_file" 2>/dev/null || true
         return 1
     fi
 
@@ -1026,11 +1288,13 @@ restore_volume() {
     if ! run_maybe_sudo mv "$temp_restore" "$vol_path"; then
         log_error "Failed to move restored data into place — recovering original"
         run_maybe_sudo mv "$original_bak" "$vol_path" 2>/dev/null || true
+        run_maybe_sudo rm -f "$journal_file" 2>/dev/null || true
         return 1
     fi
 
-    # Success — clean up original backup
+    # Success — clean up original backup and journal
     run_maybe_sudo rm -rf "$original_bak"
+    run_maybe_sudo rm -f "$journal_file" 2>/dev/null || true
 
     log_ok "${label} volume restored from backup"
 }
@@ -1043,6 +1307,59 @@ restore_redis_volume()  { restore_volume "Redis"   "redis_data" "$APP_CONTAINER"
 backup_app_volume()     { backup_volume "App"     "cloudpi$"   "$APP_CONTAINER" "/app/backups"    "$1"; }
 restore_app_volume()    { restore_volume "App"     "cloudpi$"   "$APP_CONTAINER" "/app/backups"    "$1"; }
 
+backup_current_state() {
+    # Take a snapshot of the current state (DB + Redis + App volumes).
+    # Requires containers to already be stopped.
+    # Usage: backup_current_state [--skip-prune]
+    #   --skip-prune: don't auto-prune snapshots (protects target snapshot during restore)
+    # Returns 0 on success, 1 on failure.
+    local skip_prune=false
+    if [ "${1:-}" = "--skip-prune" ]; then
+        skip_prune=true
+    fi
+
+    local backup_ts
+    backup_ts=$(date +%Y%m%d_%H%M%S)
+    mkdir -p "$BACKUP_DIR"
+
+    local pre_db="${BACKUP_DIR}/db_volume_${backup_ts}.tar"
+    local pre_redis="${BACKUP_DIR}/redis_volume_${backup_ts}.tar"
+    local pre_app="${BACKUP_DIR}/cloudpi_volume_${backup_ts}.tar"
+
+    log_info "Backing up current state before rollback/restore..."
+
+    if ! backup_db_volume "$pre_db"; then
+        log_error "Current state DB backup failed"
+        return 1
+    fi
+
+    # Redis and App are non-fatal
+    if ! backup_redis_volume "$pre_redis"; then
+        log_warn "Current state Redis backup failed — continuing"
+        pre_redis=""
+    fi
+    if ! backup_app_volume "$pre_app"; then
+        log_warn "Current state App backup failed — continuing"
+        pre_app=""
+    fi
+
+    # Temporarily disable auto-prune if requested (to protect target snapshot)
+    local saved_max_snapshots="$MAX_SNAPSHOTS"
+    if [ "$skip_prune" = true ]; then
+        MAX_SNAPSHOTS=0
+    fi
+
+    if ! create_snapshot "$pre_db" "$pre_redis" "$pre_app"; then
+        log_warn "Snapshot metadata write failed — backup files exist but snapshot not recorded"
+        MAX_SNAPSHOTS="$saved_max_snapshots"
+        return 1
+    fi
+
+    MAX_SNAPSHOTS="$saved_max_snapshots"
+    log_ok "Current state backed up as snapshot (can restore later with --restore)"
+    return 0
+}
+
 # ============================================================
 # Deployment Snapshots
 # ============================================================
@@ -1052,7 +1369,7 @@ next_snapshot_id() {
     for meta_file in "$BACKUP_DIR"/snapshot_*.meta; do
         [ -f "$meta_file" ] || continue
         local id
-        id=$(grep -m1 '^id=' "$meta_file" 2>/dev/null | cut -d= -f2-)
+        id=$(grep -m1 '^id=' "$meta_file" 2>/dev/null | cut -d= -f2- || true)
         if [ -n "$id" ] && [ "$id" -gt "$max_id" ] 2>/dev/null; then
             max_id=$id
         fi
@@ -1147,7 +1464,7 @@ read_snapshot_field() {
     local meta_file
     meta_file=$(printf "%s/snapshot_%03d.meta" "$BACKUP_DIR" "$snap_id")
     if [ -f "$meta_file" ]; then
-        grep -m1 "^${field}=" "$meta_file" 2>/dev/null | cut -d= -f2-
+        grep -m1 "^${field}=" "$meta_file" 2>/dev/null | cut -d= -f2- || true
     fi
 }
 
@@ -1258,11 +1575,11 @@ list_snapshots() {
     printf "  %-4s %-20s %-24s %-24s %s\n" "#" "Date" "App Tag" "DB Tag" "Size"
     for meta_file in "${meta_files[@]}"; do
         local s_id s_ts s_app s_db s_size s_date
-        s_id=$(grep -m1 '^id=' "$meta_file" | cut -d= -f2-)
-        s_ts=$(grep -m1 '^timestamp=' "$meta_file" | cut -d= -f2-)
-        s_app=$(grep -m1 '^app_tag=' "$meta_file" | cut -d= -f2-)
-        s_db=$(grep -m1 '^db_tag=' "$meta_file" | cut -d= -f2-)
-        s_size=$(grep -m1 '^size=' "$meta_file" | cut -d= -f2-)
+        s_id=$(grep -m1 '^id=' "$meta_file" | cut -d= -f2- || true)
+        s_ts=$(grep -m1 '^timestamp=' "$meta_file" | cut -d= -f2- || true)
+        s_app=$(grep -m1 '^app_tag=' "$meta_file" | cut -d= -f2- || true)
+        s_db=$(grep -m1 '^db_tag=' "$meta_file" | cut -d= -f2- || true)
+        s_size=$(grep -m1 '^size=' "$meta_file" | cut -d= -f2- || true)
         # Format timestamp: 2026-02-17T14:30:22Z → 2026-02-17 14:30
         s_date=$(echo "$s_ts" | sed 's/T/ /;s/:..Z$//')
         printf "  %-4s %-20s %-24s %-24s %s\n" "$s_id" "$s_date" "$s_app" "$s_db" "$s_size"
@@ -1302,12 +1619,12 @@ prune_snapshots() {
         [ "$removed" -ge "$to_remove" ] && break
 
         local sid
-        sid=$(grep -m1 '^id=' "$meta_file" 2>/dev/null | cut -d= -f2-)
+        sid=$(grep -m1 '^id=' "$meta_file" 2>/dev/null | cut -d= -f2- || true)
 
         # Delete all backup tars (db, redis, app) associated with this snapshot
         local field_name raw_path resolved_path
         for field_name in backup_file backup_redis backup_app; do
-            raw_path=$(grep -m1 "^${field_name}=" "$meta_file" 2>/dev/null | cut -d= -f2-)
+            raw_path=$(grep -m1 "^${field_name}=" "$meta_file" 2>/dev/null | cut -d= -f2- || true)
             [ -z "$raw_path" ] && continue
             resolved_path=$(resolve_backup_path "$raw_path")
             if [ -n "$resolved_path" ] && validate_backup_path "$resolved_path" && [ -f "$resolved_path" ]; then
@@ -1535,7 +1852,8 @@ do_deploy() {
     local current_tag
     current_tag=$(get_current_tag)
 
-    # Check for interrupted previous deploy
+    # Check for interrupted previous operations
+    check_interrupted_restore
     check_interrupted_deploy
 
     save_deploy_phase "preflight" "$new_tag" "$current_tag"
@@ -1590,7 +1908,10 @@ do_deploy() {
 
     # --- Step 3: Stop app container ---
     save_deploy_phase "stopping" "$new_tag" "$current_tag"
-    stop_and_remove_app
+    if ! stop_and_remove_app; then
+        log_error "App container did not stop — cannot proceed with backup"
+        exit 1
+    fi
 
     # --- Step 4: Stop DB and take volume backups (DB, Redis, App) ---
     if ! stop_db_verified 60; then
@@ -1609,9 +1930,9 @@ do_deploy() {
     if ! backup_db_volume "$CURRENT_BACKUP"; then
         log_error "Database backup failed — aborting deployment"
         log_info "Restarting containers..."
-        run_compose -f "$COMPOSE_FILE" up -d db
+        run_compose -f "$COMPOSE_FILE" up -d db || log_warn "Failed to restart DB"
         wait_for_db || true
-        run_compose -f "$COMPOSE_FILE" up -d app
+        run_compose -f "$COMPOSE_FILE" up -d app || log_warn "Failed to restart app"
         exit 1
     fi
 
@@ -1637,11 +1958,18 @@ do_deploy() {
 
     save_state "$current_tag" "rollback_target" "$current_tag" "$CURRENT_BACKUP" "$CURRENT_REDIS_BACKUP" "$CURRENT_APP_BACKUP" "$CURRENT_BACKUP_CHECKSUM"
     # Create deployment snapshot (for multi-level rollback via --history/--restore)
-    create_snapshot "$CURRENT_BACKUP" "$CURRENT_REDIS_BACKUP" "$CURRENT_APP_BACKUP"
+    if ! create_snapshot "$CURRENT_BACKUP" "$CURRENT_REDIS_BACKUP" "$CURRENT_APP_BACKUP"; then
+        log_warn "Snapshot metadata write failed — backup files exist but snapshot not recorded"
+        log_warn "Rollback via --restore may not list this deployment"
+    fi
 
     # --- Step 5: Start DB container ---
     log_info "Starting DB container..."
-    run_compose -f "$COMPOSE_FILE" up -d db
+    if ! run_compose -f "$COMPOSE_FILE" up -d db; then
+        log_error "Failed to start DB container — compose error"
+        log_error "Recovery: run 'docker compose -f $COMPOSE_FILE up -d db' manually"
+        exit 1
+    fi
     if ! wait_for_db; then
         log_error "DB failed to come back up after backup — aborting"
         exit 1
@@ -1753,7 +2081,10 @@ do_rollback_internal() {
     echo ""
 
     # Stop app
-    stop_and_remove_app
+    if ! stop_and_remove_app; then
+        log_error "App container did not stop — cannot safely rollback"
+        return 1
+    fi
 
     # Resolve backup paths from state file or current deploy run variables
     local backup_path="" redis_backup_path="" app_backup_path=""
@@ -1934,6 +2265,8 @@ do_rollback_internal() {
 }
 
 do_rollback() {
+    check_interrupted_restore
+
     local rollback_tag
     rollback_tag=$(read_state)
 
@@ -1973,6 +2306,41 @@ do_rollback() {
     if ! confirm_action "Proceed with rollback?"; then
         log_info "Rollback cancelled"
         exit 0
+    fi
+
+    # Offer to backup current state before rolling back
+    if confirm_action "Take a backup of the current state before rolling back?"; then
+        if ! stop_and_remove_app; then
+            log_error "App container did not stop — cannot take pre-rollback backup"
+            if ! confirm_action "Continue rollback WITHOUT backup?"; then
+                log_info "Rollback cancelled"
+                exit 1
+            fi
+        elif ! stop_db_verified 60; then
+            log_error "DB did not stop cleanly — cannot take pre-rollback backup"
+            if ! confirm_action "Continue rollback WITHOUT backup?"; then
+                log_info "Rollback cancelled — restarting containers..."
+                run_compose -f "$COMPOSE_FILE" up -d db
+                wait_for_db || true
+                run_compose -f "$COMPOSE_FILE" up -d app || true
+                exit 1
+            fi
+        elif ! backup_current_state; then
+            log_warn "Pre-rollback backup failed"
+            if ! confirm_action "Continue rollback WITHOUT backup?"; then
+                log_info "Rollback cancelled — restarting containers..."
+                run_compose -f "$COMPOSE_FILE" up -d db
+                wait_for_db || true
+                run_compose -f "$COMPOSE_FILE" up -d app || true
+                exit 1
+            fi
+        fi
+        # Restart DB + app so do_rollback_internal can stop them cleanly
+        # (do_rollback_internal expects containers to be running)
+        log_info "Restarting containers for rollback..."
+        run_compose -f "$COMPOSE_FILE" up -d db
+        wait_for_db || true
+        run_compose -f "$COMPOSE_FILE" up -d app || true
     fi
 
     do_rollback_internal "$rollback_tag" "Manual rollback requested"
@@ -2092,6 +2460,8 @@ do_history() {
 # Restore from Snapshot
 # ============================================================
 do_restore() {
+    check_interrupted_restore
+
     local target_id=${1:-}
 
     local count
@@ -2166,6 +2536,19 @@ do_restore() {
         exit 1
     fi
 
+    # Warn if db_tag is missing — restoring old data against a newer DB image can cause corruption
+    if [ -z "$snap_db_tag" ]; then
+        local current_db_img
+        current_db_img=$(get_db_tag)
+        log_warn "Snapshot #${target_id}: db_tag is empty (snapshot was created before db_tag tracking)"
+        log_warn "Current DB image tag: ${current_db_img:-unknown}"
+        log_warn "Restoring old data against a mismatched DB version can cause MySQL errors"
+        if ! confirm_action "Continue restore without DB version verification?"; then
+            log_info "Restore cancelled"
+            exit 0
+        fi
+    fi
+
     # Verify snapshot integrity
     echo ""
     log_info "Verifying snapshot #${target_id}..."
@@ -2207,12 +2590,32 @@ do_restore() {
     DEPLOY_IN_PROGRESS=true
 
     # --- Stop app ---
-    stop_and_remove_app
+    if ! stop_and_remove_app; then
+        log_error "App container did not stop — cannot proceed with restore"
+        DEPLOY_IN_PROGRESS=false
+        exit 1
+    fi
 
     # --- Stop DB (generous timeout) ---
     if ! stop_db_verified 60; then
         log_error "DB container did not stop cleanly — aborting restore"
+        DEPLOY_IN_PROGRESS=false
         exit 1
+    fi
+
+    # --- Offer to backup current state before restoring ---
+    if confirm_action "Take a backup of the current state before restoring?"; then
+        if ! backup_current_state --skip-prune; then
+            log_warn "Pre-restore backup failed"
+            if ! confirm_action "Continue restore WITHOUT backup?"; then
+                log_info "Restore cancelled — restarting containers..."
+                run_compose -f "$COMPOSE_FILE" up -d db
+                wait_for_db || true
+                run_compose -f "$COMPOSE_FILE" up -d app || true
+                DEPLOY_IN_PROGRESS=false
+                exit 1
+            fi
+        fi
     fi
 
     # --- Validate and restore DB volume ---
@@ -2256,11 +2659,29 @@ do_restore() {
 
     # --- Revert image tags ---
     log_info "Reverting app image tag to: $snap_app_tag"
-    set_image_tag "$snap_app_tag"
+    if ! set_image_tag "$snap_app_tag"; then
+        log_error "Failed to revert app image tag — docker-compose.yml may be corrupted"
+        log_error "Manual fix: edit $COMPOSE_FILE and set the app image tag to $snap_app_tag"
+        save_state "$snap_app_tag" "restore_failed" "$current_tag" "$snap_backup"
+        DEPLOY_IN_PROGRESS=false
+        exit 1
+    fi
 
     if [ -n "$snap_db_tag" ] && [ "$snap_db_tag" != "$current_db_tag" ]; then
         log_info "Reverting DB image tag to: $snap_db_tag"
-        set_db_image_tag "$snap_db_tag"
+        if ! set_db_image_tag "$snap_db_tag"; then
+            log_error "Failed to revert DB image tag — docker-compose.yml in mixed-tag state"
+            log_error "App tag updated to $snap_app_tag but DB tag is still $current_db_tag"
+            # Restore compose file from backup if available (set_image_tag/set_db_image_tag create .bak)
+            if [ -f "${COMPOSE_FILE}.bak" ]; then
+                log_warn "Restoring docker-compose.yml from backup to consistent state"
+                cp "${COMPOSE_FILE}.bak" "$COMPOSE_FILE"
+            fi
+            log_error "Manual fix: edit $COMPOSE_FILE and set both tags correctly"
+            save_state "$snap_app_tag" "restore_failed" "$current_tag" "$snap_backup"
+            DEPLOY_IN_PROGRESS=false
+            exit 1
+        fi
     fi
 
     # --- Clear migration lockout ---
@@ -2268,7 +2689,12 @@ do_restore() {
 
     # --- Start DB ---
     log_info "Starting DB container..."
-    run_compose -f "$COMPOSE_FILE" up -d db
+    if ! run_compose -f "$COMPOSE_FILE" up -d db; then
+        log_error "Failed to start DB container — compose error"
+        save_state "$snap_app_tag" "restore_failed" "$current_tag" "$snap_backup"
+        DEPLOY_IN_PROGRESS=false
+        exit 1
+    fi
     if ! wait_for_db; then
         log_error "DB failed to start after restore — manual intervention needed"
         save_state "$snap_app_tag" "restore_failed" "$current_tag" "$snap_backup"
@@ -2278,25 +2704,41 @@ do_restore() {
 
     # --- Start app ---
     log_info "Starting app container..."
-    run_compose -f "$COMPOSE_FILE" up -d app
+    if ! run_compose -f "$COMPOSE_FILE" up -d app; then
+        log_error "Failed to start app container after restore"
+        save_state "$snap_app_tag" "restore_failed" "$current_tag" "$snap_backup"
+        DEPLOY_IN_PROGRESS=false
+        exit 1
+    fi
 
     sleep 3
 
     # Wait for health (using existing function)
+    local restore_status="restored_from_snapshot_${target_id}"
     if wait_for_healthy; then
         log_ok "App is healthy"
-    else
-        log_warn "App health check timed out — container may still be starting"
+    elif is_container_running "$APP_CONTAINER"; then
+        restore_status="restored_unhealthy_from_snapshot_${target_id}"
+        log_warn "App health check timed out but container is running"
         log_warn "Monitor with: docker logs -f $APP_CONTAINER"
+    else
+        log_error "App container is not running after restore — restore incomplete"
+        save_state "$snap_app_tag" "restore_failed" "$current_tag" "$snap_backup"
+        DEPLOY_IN_PROGRESS=false
+        exit 1
     fi
 
     # --- Update state ---
-    save_state "$snap_app_tag" "restored_from_snapshot_${target_id}" "$current_tag" "$snap_backup" "$snap_redis_backup" "$snap_app_backup"
+    save_state "$snap_app_tag" "$restore_status" "$current_tag" "$snap_backup" "$snap_redis_backup" "$snap_app_backup"
     DEPLOY_IN_PROGRESS=false
 
     echo ""
     echo "=========================================="
-    log_ok "RESTORE COMPLETE — Snapshot #${target_id}"
+    if [ "$restore_status" = "restored_from_snapshot_${target_id}" ]; then
+        log_ok "RESTORE COMPLETE — Snapshot #${target_id}"
+    else
+        log_warn "RESTORE COMPLETE (UNHEALTHY) — Snapshot #${target_id}"
+    fi
     echo "=========================================="
     echo "  App:  ${DOCKER_REPOSITORY}:${snap_app_tag}"
     echo "  DB:   ${DOCKER_REPOSITORY}:${snap_db_tag}"
@@ -2340,6 +2782,8 @@ do_prune() {
 # First-Time Deployment (--init)
 # ============================================================
 do_init() {
+    check_interrupted_restore
+
     local new_tag=$1
     local new_db_tag=$2
     DEPLOY_IN_PROGRESS=true
@@ -2385,7 +2829,7 @@ do_init() {
             log_info "Init cancelled"
             exit 0
         fi
-        stop_and_remove_app
+        stop_and_remove_app || true  # Best-effort during init cleanup
         run_compose -f "$COMPOSE_FILE" stop db 2>/dev/null || true
     fi
 
@@ -2399,7 +2843,11 @@ do_init() {
     fi
     if [ "$current_tag" != "$new_tag" ]; then
         log_info "Updating app image tag: ${current_tag} → ${new_tag}"
-        set_image_tag "$new_tag"
+        if ! set_image_tag "$new_tag"; then
+            log_error "Failed to update app image tag in $COMPOSE_FILE"
+            DEPLOY_IN_PROGRESS=false
+            exit 1
+        fi
     fi
 
     local current_db_tag
@@ -2410,7 +2858,15 @@ do_init() {
     fi
     if [ "$current_db_tag" != "$new_db_tag" ]; then
         log_info "Updating DB image tag: ${current_db_tag} → ${new_db_tag}"
-        set_db_image_tag "$new_db_tag"
+        if ! set_db_image_tag "$new_db_tag"; then
+            log_error "Failed to update DB image tag — docker-compose.yml in mixed-tag state"
+            if [ -f "${COMPOSE_FILE}.bak" ]; then
+                log_warn "Restoring docker-compose.yml from backup"
+                cp "${COMPOSE_FILE}.bak" "$COMPOSE_FILE"
+            fi
+            DEPLOY_IN_PROGRESS=false
+            exit 1
+        fi
     fi
 
     # --- Step 4: Pull images ---
@@ -2433,7 +2889,11 @@ do_init() {
 
     # --- Step 5: Start DB ---
     log_info "Starting DB container..."
-    run_compose -f "$COMPOSE_FILE" up -d db
+    if ! run_compose -f "$COMPOSE_FILE" up -d db; then
+        log_error "Failed to start DB container — check: docker compose -f $COMPOSE_FILE up -d db"
+        DEPLOY_IN_PROGRESS=false
+        exit 1
+    fi
     if ! wait_for_db; then
         log_error "DB failed to start — check docker logs $DB_CONTAINER"
         DEPLOY_IN_PROGRESS=false
@@ -2442,7 +2902,11 @@ do_init() {
 
     # --- Step 6: Start app ---
     log_info "Starting app container..."
-    run_compose -f "$COMPOSE_FILE" up -d app
+    if ! run_compose -f "$COMPOSE_FILE" up -d app; then
+        log_error "Failed to start app container — check: docker compose -f $COMPOSE_FILE up -d app"
+        DEPLOY_IN_PROGRESS=false
+        exit 1
+    fi
 
     # Wait for container to start
     local startup_wait=0
@@ -2503,7 +2967,9 @@ do_init() {
     local snapshot_created=false
 
     # Stop app briefly for consistent backup
-    stop_and_remove_app
+    if ! stop_and_remove_app; then
+        log_warn "App container did not stop cleanly — snapshot may be inconsistent"
+    fi
 
     if ! stop_db_verified 60; then
         log_warn "Could not stop DB for snapshot — skipping initial snapshot"
@@ -2511,8 +2977,11 @@ do_init() {
         if backup_db_volume "$init_backup"; then
             backup_redis_volume "$init_redis_backup" || init_redis_backup=""
             backup_app_volume "$init_app_backup" || init_app_backup=""
-            create_snapshot "$init_backup" "$init_redis_backup" "$init_app_backup"
-            snapshot_created=true
+            if create_snapshot "$init_backup" "$init_redis_backup" "$init_app_backup"; then
+                snapshot_created=true
+            else
+                log_warn "Snapshot metadata write failed — backup files exist but snapshot not recorded"
+            fi
         else
             log_warn "DB backup failed — no initial snapshot"
         fi
@@ -2520,13 +2989,21 @@ do_init() {
 
     # Restart everything
     log_info "Starting all services..."
-    run_compose -f "$COMPOSE_FILE" up -d db
+    if ! run_compose -f "$COMPOSE_FILE" up -d db; then
+        log_error "Failed to restart DB after snapshot — manual intervention needed"
+        DEPLOY_IN_PROGRESS=false
+        exit 1
+    fi
     if ! wait_for_db; then
         log_error "DB failed to restart after snapshot — manual intervention needed"
         DEPLOY_IN_PROGRESS=false
         exit 1
     fi
-    run_compose -f "$COMPOSE_FILE" up -d app
+    if ! run_compose -f "$COMPOSE_FILE" up -d app; then
+        log_error "Failed to restart app after snapshot — manual intervention needed"
+        DEPLOY_IN_PROGRESS=false
+        exit 1
+    fi
     if ! wait_for_healthy; then
         log_error "App failed to restart after snapshot — manual intervention needed"
         DEPLOY_IN_PROGRESS=false
