@@ -17,6 +17,7 @@
 #   ./cp_upgrade.sh --backup --skip-prune  # Ad-hoc snapshot, keep all existing snapshots
 #   ./cp_upgrade.sh --backup-dir /path <cmd>  # Override backup directory (works with any command)
 #   ./cp_upgrade.sh --config-show          # Show current effective config + active file
+#   ./cp_upgrade.sh --config-keys          # List all keys you can set with --config-set
 #   ./cp_upgrade.sh --config-set KEY=VALUE # Persist a setting to cp_upgrade.conf
 #   ./cp_upgrade.sh --init <app-tag> <db-tag>  # First-time deployment (no existing data)
 #
@@ -221,9 +222,12 @@ if [ -n "${COMPOSE_PROJECT_NAME:-}" ]; then
 fi
 
 # Timeouts
-MIGRATION_TIMEOUT="${MIGRATION_TIMEOUT:-300}"  # 5 minutes max for migrations
+MIGRATION_TIMEOUT="${MIGRATION_TIMEOUT:-900}"  # 15 minutes for migrations (default)
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-120}"         # 2 minutes for health check after migrations
 DB_WAIT_TIMEOUT="${DB_WAIT_TIMEOUT:-60}"        # 1 minute for DB readiness
+
+# Optional explicit Node-side per-migration timeout override (milliseconds).
+MIGRATION_TIMEOUT_MS_EXPLICIT="${MIGRATION_TIMEOUT_MS:-}"
 
 # Snapshots
 MAX_SNAPSHOTS="${MAX_SNAPSHOTS:-5}"             # Auto-prune oldest beyond this count (0 = unlimited)
@@ -244,6 +248,21 @@ for _cfg_var in MIGRATION_TIMEOUT HEALTH_TIMEOUT DB_WAIT_TIMEOUT MAX_SNAPSHOTS; 
         exit 1
     fi
 done
+if [ -n "$MIGRATION_TIMEOUT_MS_EXPLICIT" ] && ! [[ "$MIGRATION_TIMEOUT_MS_EXPLICIT" =~ ^[0-9]+$ ]]; then
+    echo "Error: MIGRATION_TIMEOUT_MS must be a non-negative integer (got: '${MIGRATION_TIMEOUT_MS_EXPLICIT}')" >&2
+    exit 1
+fi
+# Effective Node-side per-migration timeout used for app container startup.
+# Priority:
+#   1. Explicit MIGRATION_TIMEOUT_MS env var passed to this script
+#   2. Derived from MIGRATION_TIMEOUT * 1000
+if [ -n "$MIGRATION_TIMEOUT_MS_EXPLICIT" ]; then
+    EFFECTIVE_MIGRATION_TIMEOUT_MS="$MIGRATION_TIMEOUT_MS_EXPLICIT"
+    EFFECTIVE_MIGRATION_TIMEOUT_MS_SOURCE="environment"
+else
+    EFFECTIVE_MIGRATION_TIMEOUT_MS="$((MIGRATION_TIMEOUT * 1000))"
+    EFFECTIVE_MIGRATION_TIMEOUT_MS_SOURCE="derived"
+fi
 unset _cfg_var
 
 # ============================================================
@@ -314,7 +333,7 @@ esac
 # Skip lock for read-only + config-management commands. --config-set writes a
 # text file atomically via rename, which doesn't conflict with an in-progress deploy.
 case "${1:-}" in
-    --status|-s|--history|-H|--help|-h|--config-show|--config-set|"")
+    --status|-s|--history|-H|--help|-h|--config-show|--config-set|--config-keys|"")
         # No lock needed — these either read state or atomically write a config file
         ;;
     *)
@@ -439,7 +458,7 @@ fi
 # Installing a stub run_docker lets the rest of the script load cleanly without
 # requiring a reachable Docker daemon when the user just wants to edit config.
 case "${1:-}" in
-    --config-show|--config-set|--help|-h|"")
+    --config-show|--config-set|--config-keys|--help|-h|"")
         run_docker() { echo "Error: Docker not available in this invocation" >&2; return 1; }
         # Skip the Docker probe and the compose-project resolution below.
         _skip_docker_probe=1
@@ -522,7 +541,7 @@ detect_fs_sudo() {
 # Only probe filesystem sudo for mutating commands that touch volumes.
 # Read-only commands don't need volume access.
 case "${1:-}" in
-    --status|-s|--history|-H|--help|-h|--config-show|--config-set|"")
+    --status|-s|--history|-H|--help|-h|--config-show|--config-set|--config-keys|"")
         # No FS sudo detection needed — these either read state or write a text config
         ;;
     *)
@@ -594,6 +613,45 @@ else
     echo "Error: Docker Compose not found (neither 'docker compose' nor 'docker-compose')" >&2
     exit 1
 fi
+
+# App-only compose wrapper to inject MIGRATION_TIMEOUT_MS at runtime.
+# This keeps env injection scoped to app startup without affecting other compose calls.
+run_compose_app_up() {
+    local compose_args=(-f "$COMPOSE_FILE" up -d --no-deps app)
+
+    if [ "${_skip_docker_probe:-0}" = "1" ]; then
+        echo "Error: Docker Compose not available in this invocation" >&2
+        return 1
+    fi
+
+    if run_docker compose version >/dev/null 2>&1; then
+        if [ "$NEEDS_DOCKER_SUDO" = true ]; then
+            if [ -f "${SUDO_EXPIRED_MARKER:-}" ]; then
+                echo -e "\033[0;31m[ERROR]\033[0m sudo credentials have expired — re-run the script" >&2
+                return 1
+            fi
+            sudo env MIGRATION_TIMEOUT_MS="$EFFECTIVE_MIGRATION_TIMEOUT_MS" \
+                docker "${DOCKER_CONFIG_FLAG[@]}" compose "${compose_args[@]}"
+        else
+            MIGRATION_TIMEOUT_MS="$EFFECTIVE_MIGRATION_TIMEOUT_MS" \
+                docker "${DOCKER_CONFIG_FLAG[@]}" compose "${compose_args[@]}"
+        fi
+    elif command -v docker-compose >/dev/null 2>&1; then
+        if [ "$NEEDS_DOCKER_SUDO" = true ]; then
+            if [ -f "${SUDO_EXPIRED_MARKER:-}" ]; then
+                echo -e "\033[0;31m[ERROR]\033[0m sudo credentials have expired — re-run the script" >&2
+                return 1
+            fi
+            sudo env MIGRATION_TIMEOUT_MS="$EFFECTIVE_MIGRATION_TIMEOUT_MS" \
+                docker-compose "${compose_args[@]}"
+        else
+            MIGRATION_TIMEOUT_MS="$EFFECTIVE_MIGRATION_TIMEOUT_MS" docker-compose "${compose_args[@]}"
+        fi
+    else
+        echo "Error: Docker Compose not found (neither 'docker compose' nor 'docker-compose')" >&2
+        return 1
+    fi
+}
 
 # ============================================================
 # Compose Project Name Resolution (deferred until compose is available)
@@ -2258,7 +2316,11 @@ monitor_migration() {
         if [ "$cur_restart_count" -gt "$prev_restart_count" ] 2>/dev/null; then
             log_error "Container is crash-looping (restart count: ${prev_restart_count} -> ${cur_restart_count})"
             local err_logs
-            err_logs=$(run_docker logs --tail 20 "$APP_CONTAINER" 2>&1 | grep '\[migration\]' | tail -10 || true)
+            # Prefer the structured error block (full name/code/SQL/stack) if present.
+            err_logs=$(run_docker logs "$APP_CONTAINER" 2>&1 | sed -n '/MIGRATION ERROR START/,/MIGRATION ERROR END/p' | tail -200 || true)
+            if [ -z "$err_logs" ]; then
+                err_logs=$(run_docker logs --tail 20 "$APP_CONTAINER" 2>&1 | grep '\[migration\]' | tail -10 || true)
+            fi
             if [ -n "$err_logs" ]; then
                 while IFS= read -r line; do
                     log_error "  $line"
@@ -2273,9 +2335,14 @@ monitor_migration() {
             exit_code=$(run_docker inspect -f '{{.State.ExitCode}}' "$APP_CONTAINER" 2>/dev/null || echo "unknown")
             if [ "$exit_code" != "0" ]; then
                 log_error "Container exited with code $exit_code"
-                # Show last migration log lines (|| true guards against set -e + pipefail)
+                # Show the structured error block (full name/code/SQL/stack) if present,
+                # otherwise fall back to the tail of [migration]-prefixed lines.
+                # (|| true guards against set -e + pipefail.)
                 local err_logs
-                err_logs=$(run_docker logs "$APP_CONTAINER" 2>&1 | grep '\[migration\]' | tail -10 || true)
+                err_logs=$(run_docker logs "$APP_CONTAINER" 2>&1 | sed -n '/MIGRATION ERROR START/,/MIGRATION ERROR END/p' | tail -200 || true)
+                if [ -z "$err_logs" ]; then
+                    err_logs=$(run_docker logs "$APP_CONTAINER" 2>&1 | grep '\[migration\]' | tail -10 || true)
+                fi
                 if [ -n "$err_logs" ]; then
                     while IFS= read -r line; do
                         log_error "  $line"
@@ -2335,6 +2402,18 @@ monitor_migration() {
         if [ "$found_success" != true ] && [ "$found_failure" != true ]; then
             if run_docker exec "$APP_CONTAINER" test -f "$LOCKOUT_FILE_PATH" 2>/dev/null; then
                 log_warn "Lockout file detected — migration entered lockout sleep"
+                # Surface the lockout file contents (includes the structured error
+                # block from migrator.ts: name, code, failed SQL, stack) so the
+                # developer can diagnose without docker exec-ing into the container.
+                local lockout_contents
+                lockout_contents=$(run_docker exec "$APP_CONTAINER" cat "$LOCKOUT_FILE_PATH" 2>/dev/null || true)
+                if [ -n "$lockout_contents" ]; then
+                    log_error "----- migration lockout file (${LOCKOUT_FILE_PATH}) -----"
+                    while IFS= read -r line; do
+                        log_error "  $line"
+                    done <<< "$lockout_contents"
+                    log_error "----- end lockout file -----"
+                fi
                 found_failure=true
             fi
         fi
@@ -2527,7 +2606,7 @@ do_deploy() {
         log_info "Restarting containers..."
         run_compose -f "$COMPOSE_FILE" up -d db || log_warn "Failed to restart DB"
         wait_for_db || true
-        run_compose -f "$COMPOSE_FILE" up -d app || log_warn "Failed to restart app"
+        run_compose_app_up || log_warn "Failed to restart app"
         exit 1
     fi
 
@@ -2588,7 +2667,7 @@ do_deploy() {
     # --- Step 8: Start app container ---
     save_deploy_phase "starting" "$new_tag" "$current_tag" "$CURRENT_BACKUP"
     log_info "Starting app container with new image..."
-    if ! run_compose -f "$COMPOSE_FILE" up -d app; then
+    if ! run_compose_app_up; then
         log_error "Failed to start app container"
         do_rollback_internal "$current_tag" "Failed to start app container"
         return 1
@@ -2959,7 +3038,7 @@ do_rollback_internal() {
 
     # Start with old image
     log_info "Starting app with previous image..."
-    if ! run_compose -f "$COMPOSE_FILE" up -d app; then
+    if ! run_compose_app_up; then
         log_error "Failed to start app container with rollback image"
         _save_rollback_failed
         return 1
@@ -3056,7 +3135,7 @@ do_rollback() {
                 log_info "Rollback cancelled — restarting containers..."
                 run_compose -f "$COMPOSE_FILE" up -d db
                 wait_for_db || true
-                run_compose -f "$COMPOSE_FILE" up -d app || true
+                run_compose_app_up || true
                 exit 1
             fi
         elif ! backup_current_state --source=pre-rollback; then
@@ -3065,7 +3144,7 @@ do_rollback() {
                 log_info "Rollback cancelled — restarting containers..."
                 run_compose -f "$COMPOSE_FILE" up -d db
                 wait_for_db || true
-                run_compose -f "$COMPOSE_FILE" up -d app || true
+                run_compose_app_up || true
                 exit 1
             fi
         fi
@@ -3074,7 +3153,7 @@ do_rollback() {
         log_info "Restarting containers for rollback..."
         run_compose -f "$COMPOSE_FILE" up -d db
         wait_for_db || true
-        run_compose -f "$COMPOSE_FILE" up -d app || true
+        run_compose_app_up || true
     fi
 
     do_rollback_internal "$rollback_tag" "Manual rollback requested"
@@ -3383,7 +3462,7 @@ do_restore() {
                 log_info "Restore cancelled — restarting containers..."
                 run_compose -f "$COMPOSE_FILE" up -d db
                 wait_for_db || true
-                run_compose -f "$COMPOSE_FILE" up -d app || true
+                run_compose_app_up || true
                 DEPLOY_IN_PROGRESS=false
                 exit 1
             fi
@@ -3505,7 +3584,7 @@ do_restore() {
 
     # --- Start app ---
     log_info "Starting app container..."
-    if ! run_compose -f "$COMPOSE_FILE" up -d app; then
+    if ! run_compose_app_up; then
         log_error "Failed to start app container after restore"
         _restore_fail_save_state "$snap_app_tag"
         DEPLOY_IN_PROGRESS=false
@@ -3848,7 +3927,7 @@ do_backup() {
     if ! stop_db_verified 60; then
         log_error "DB container did not stop cleanly — aborting backup"
         log_info "Attempting to restart app..."
-        run_compose -f "$COMPOSE_FILE" up -d app || log_warn "Failed to restart app"
+        run_compose_app_up || log_warn "Failed to restart app"
         exit 1
     fi
 
@@ -3879,9 +3958,9 @@ do_backup() {
     fi
 
     log_info "Restarting app container..."
-    if ! run_compose -f "$COMPOSE_FILE" up -d app; then
+    if ! run_compose_app_up; then
         log_error "Failed to restart app container after backup"
-        log_error "Manual recovery: docker compose -f $COMPOSE_FILE up -d app"
+        log_error "Manual recovery: re-run $0 to restart the app via the scripted workflow"
         exit 1
     fi
 
@@ -3958,6 +4037,7 @@ do_config_show() {
     echo "    BACKUP_ENC_CIPHER   = ${BACKUP_ENC_CIPHER}"
     echo "    MAX_SNAPSHOTS       = ${MAX_SNAPSHOTS}"
     echo "    MIGRATION_TIMEOUT   = ${MIGRATION_TIMEOUT}"
+    echo "    MIGRATION_TIMEOUT_MS = ${EFFECTIVE_MIGRATION_TIMEOUT_MS} (source: ${EFFECTIVE_MIGRATION_TIMEOUT_MS_SOURCE})"
     echo "    HEALTH_TIMEOUT      = ${HEALTH_TIMEOUT}"
     echo "    DB_WAIT_TIMEOUT     = ${DB_WAIT_TIMEOUT}"
     echo ""
@@ -3973,6 +4053,84 @@ do_config_show() {
 }
 
 # Write or remove a KEY=value line in the config file.
+# Print a detailed reference of every key accepted by --config-set.
+# Keep this in sync with _is_allowed_config_key and the variable defaults near the top.
+do_config_keys() {
+    cat <<'EOF'
+Configuration keys accepted by --config-set
+===========================================
+Persist any of these to cp_upgrade.conf so future runs inherit them.
+
+Precedence (highest wins):
+  1. CLI flag (e.g. --backup-dir)
+  2. Environment variable
+  3. Persistent config file (--config-set)
+  4. Built-in default
+
+BACKUP_DIR
+  Where snapshot .tar files are stored. Relative paths resolve from SCRIPT_DIR.
+  Default:  ${SCRIPT_DIR}/backups
+  Example:  --config-set BACKUP_DIR=/datadisk/cloudpi-backups
+
+BACKUP_ENCRYPT
+  Encrypt backups with OpenSSL (AES-256-CBC + PBKDF2). Backups gain a .enc suffix.
+  Default:  0       (disabled)
+  Values:   0 | 1
+  Example:  --config-set BACKUP_ENCRYPT=1
+  NOTE:     Requires BACKUP_KEY_FILE to be set and readable.
+
+BACKUP_KEY_FILE
+  Path to the key file used when BACKUP_ENCRYPT=1.
+  Default:  (empty — required when encryption is enabled)
+  Create:   head -c 64 /dev/urandom | base64 > /etc/cloudpi/backup.key
+            chmod 600 /etc/cloudpi/backup.key
+  Example:  --config-set BACKUP_KEY_FILE=/etc/cloudpi/backup.key
+
+BACKUP_ENC_CIPHER
+  OpenSSL cipher name used when BACKUP_ENCRYPT=1.
+  Default:  aes-256-cbc
+  Example:  --config-set BACKUP_ENC_CIPHER=aes-256-cbc
+
+MAX_SNAPSHOTS
+  Auto-prune oldest snapshots beyond this count after each successful backup.
+  Default:  5        (0 = unlimited, keep every snapshot forever)
+  Range:    non-negative integer
+  Example:  --config-set MAX_SNAPSHOTS=3
+
+MIGRATION_TIMEOUT
+  Max seconds to wait for DB migrations to finish before aborting the deploy.
+  Default:  900      (15 minutes — used to derive MIGRATION_TIMEOUT_MS when unset)
+  Range:    non-negative integer (seconds)
+  Example:  --config-set MIGRATION_TIMEOUT=1800
+
+HEALTH_TIMEOUT
+  Max seconds to wait for the app container to become healthy after migrations.
+  Default:  120      (2 minutes)
+  Range:    non-negative integer (seconds)
+  Example:  --config-set HEALTH_TIMEOUT=180
+
+DB_WAIT_TIMEOUT
+  Max seconds to wait for the DB container to become ready before starting app.
+  Default:  60       (1 minute)
+  Range:    non-negative integer (seconds)
+  Example:  --config-set DB_WAIT_TIMEOUT=120
+
+MIGRATION_TIMEOUT_MS (environment-only override)
+  Override the derived Node-side per-migration timeout in milliseconds.
+  Not persisted by --config-set; export in the shell for a one-off run.
+
+Removing a key (revert to default):
+  ./cp_upgrade.sh --config-set KEY=       # empty value on right-hand side
+  ./cp_upgrade.sh --config-set KEY        # no '=' at all
+
+Inspecting the current effective values and active config file:
+  ./cp_upgrade.sh --config-show
+
+Allowed value characters: letters, digits, space, and  / . _ - : = + @
+Disallowed:               $ ` \ ; | & ( ) < > [ ] and control characters
+EOF
+}
+
 # Usage: do_config_set "KEY=VALUE"   (atomic: write temp, validate, rename)
 #        do_config_set "KEY="        (empty value → remove line)
 #        do_config_set "KEY"         (no `=` → remove line)
@@ -3983,9 +4141,10 @@ do_config_set() {
         echo "Usage: $0 --config-set BACKUP_DIR=/data/cloudpi-backups" >&2
         echo "       $0 --config-set BACKUP_ENCRYPT=1" >&2
         echo "       $0 --config-set BACKUP_KEY_FILE=    # empty value removes the line" >&2
-        echo ""
-        echo "Allowed keys: BACKUP_DIR BACKUP_ENCRYPT BACKUP_KEY_FILE BACKUP_ENC_CIPHER"
-        echo "              MAX_SNAPSHOTS MIGRATION_TIMEOUT HEALTH_TIMEOUT DB_WAIT_TIMEOUT"
+        echo "" >&2
+        echo "Run  '$0 --config-keys'  for the full reference (defaults, examples, notes)." >&2
+        echo "Allowed keys: BACKUP_DIR BACKUP_ENCRYPT BACKUP_KEY_FILE BACKUP_ENC_CIPHER" >&2
+        echo "              MAX_SNAPSHOTS MIGRATION_TIMEOUT HEALTH_TIMEOUT DB_WAIT_TIMEOUT" >&2
         return 1
     fi
 
@@ -4007,6 +4166,7 @@ do_config_set() {
         echo "Error: '$key' is not an allowed config key" >&2
         echo "Allowed: BACKUP_DIR BACKUP_ENCRYPT BACKUP_KEY_FILE BACKUP_ENC_CIPHER" >&2
         echo "         MAX_SNAPSHOTS MIGRATION_TIMEOUT HEALTH_TIMEOUT DB_WAIT_TIMEOUT" >&2
+        echo "Run '$0 --config-keys' for defaults, examples, and notes." >&2
         return 1
     fi
 
@@ -4228,8 +4388,8 @@ do_init() {
 
     # --- Step 6: Start app ---
     log_info "Starting app container..."
-    if ! run_compose -f "$COMPOSE_FILE" up -d app; then
-        log_error "Failed to start app container — check: docker compose -f $COMPOSE_FILE up -d app"
+    if ! run_compose_app_up; then
+        log_error "Failed to start app container — re-run $0 to retry app startup"
         DEPLOY_IN_PROGRESS=false
         exit 1
     fi
@@ -4332,7 +4492,7 @@ do_init() {
         DEPLOY_IN_PROGRESS=false
         exit 1
     fi
-    if ! run_compose -f "$COMPOSE_FILE" up -d app; then
+    if ! run_compose_app_up; then
         log_error "Failed to restart app after snapshot — manual intervention needed"
         DEPLOY_IN_PROGRESS=false
         exit 1
@@ -4387,9 +4547,11 @@ usage() {
     echo "                  restarts. Useful for manual checkpoints or cron-scheduled backups."
     echo "                  Add 'skip-prune' arg to keep all existing snapshots."
     echo "  --config-show   Show current effective configuration and which config file is active"
+    echo "  --config-keys   List every key you can pass to --config-set (with defaults + examples)"
     echo "  --config-set K=V  Persist a setting to cp_upgrade.conf so future runs inherit it"
     echo "                  Allowed keys: BACKUP_DIR BACKUP_ENCRYPT BACKUP_KEY_FILE"
     echo "                  BACKUP_ENC_CIPHER MAX_SNAPSHOTS MIGRATION_TIMEOUT HEALTH_TIMEOUT"
+    echo "                  DB_WAIT_TIMEOUT. Run '$0 --config-keys' for full reference."
     echo "                  Remove a key:  $0 --config-set KEY=   (empty value)"
     echo ""
     echo "Options:"
@@ -4401,7 +4563,8 @@ usage() {
     echo "                        Example: --backup-dir=/mnt/archive/backups"
     echo ""
     echo "Environment variables:"
-    echo "  MIGRATION_TIMEOUT   Max seconds to wait for migration (default: 300)"
+    echo "  MIGRATION_TIMEOUT_MS  Environment-only override (ms) for app migration timeout"
+    echo "  MIGRATION_TIMEOUT   Max seconds to wait for migration (default: 900)"
     echo "  HEALTH_TIMEOUT      Max seconds to wait for health check (default: 120)"
     echo "  MAX_SNAPSHOTS       Max snapshots to keep (default: 5, 0 = unlimited)"
     echo "  BACKUP_DIR          Backup location (default: \${SCRIPT_DIR}/backups)"
@@ -4480,6 +4643,9 @@ case "${1:-}" in
         ;;
     --config-show)
         do_config_show
+        ;;
+    --config-keys)
+        do_config_keys
         ;;
     --config-set)
         do_config_set "${2:-}"
