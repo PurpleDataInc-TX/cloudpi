@@ -614,14 +614,20 @@ else
     exit 1
 fi
 
-# App-only compose wrapper to inject MIGRATION_TIMEOUT_MS at runtime.
-# This keeps env injection scoped to app startup without affecting other compose calls.
+# App-only compose wrapper that syncs MIGRATION_TIMEOUT_MS into .env for derived values,
+# but uses a runtime env override when MIGRATION_TIMEOUT_MS is explicitly set.
+# This keeps timeout handling scoped to app startup without affecting other compose calls.
 run_compose_app_up() {
     local compose_args=(-f "$COMPOSE_FILE" up -d --no-deps app)
+    local use_env_override=false
+    local env_backup=""
 
     if [ "${_skip_docker_probe:-0}" = "1" ]; then
         echo "Error: Docker Compose not available in this invocation" >&2
         return 1
+    fi
+    if [ "${EFFECTIVE_MIGRATION_TIMEOUT_MS_SOURCE:-}" = "environment" ]; then
+        use_env_override=true
     fi
 
     if run_docker compose version >/dev/null 2>&1; then
@@ -630,11 +636,8 @@ run_compose_app_up() {
                 echo -e "\033[0;31m[ERROR]\033[0m sudo credentials have expired — re-run the script" >&2
                 return 1
             fi
-            sudo env MIGRATION_TIMEOUT_MS="$EFFECTIVE_MIGRATION_TIMEOUT_MS" \
-                docker "${DOCKER_CONFIG_FLAG[@]}" compose "${compose_args[@]}"
         else
-            MIGRATION_TIMEOUT_MS="$EFFECTIVE_MIGRATION_TIMEOUT_MS" \
-                docker "${DOCKER_CONFIG_FLAG[@]}" compose "${compose_args[@]}"
+            :
         fi
     elif command -v docker-compose >/dev/null 2>&1; then
         if [ "$NEEDS_DOCKER_SUDO" = true ]; then
@@ -642,15 +645,161 @@ run_compose_app_up() {
                 echo -e "\033[0;31m[ERROR]\033[0m sudo credentials have expired — re-run the script" >&2
                 return 1
             fi
-            sudo env MIGRATION_TIMEOUT_MS="$EFFECTIVE_MIGRATION_TIMEOUT_MS" \
-                docker-compose "${compose_args[@]}"
         else
-            MIGRATION_TIMEOUT_MS="$EFFECTIVE_MIGRATION_TIMEOUT_MS" docker-compose "${compose_args[@]}"
+            :
         fi
     else
         echo "Error: Docker Compose not found (neither 'docker compose' nor 'docker-compose')" >&2
         return 1
     fi
+
+    if [ "$use_env_override" = false ]; then
+        if ! env_backup="$(mktemp "${ENV_FILE}.bak.XXXXXX")"; then
+            echo "Error: failed to create .env backup before app startup" >&2
+            return 1
+        fi
+        if ! cp -p "$ENV_FILE" "$env_backup"; then
+            rm -f "$env_backup" 2>/dev/null || true
+            echo "Error: failed to back up .env before app startup" >&2
+            return 1
+        fi
+        if ! sync_env_migration_timeout; then
+            rm -f "$env_backup" 2>/dev/null || true
+            echo "Error: failed to sync MIGRATION_TIMEOUT_MS into .env before app startup" >&2
+            return 1
+        fi
+    fi
+
+    if run_docker compose version >/dev/null 2>&1; then
+        if [ "$NEEDS_DOCKER_SUDO" = true ]; then
+            if [ "$use_env_override" = true ]; then
+                if ! sudo env MIGRATION_TIMEOUT_MS="$EFFECTIVE_MIGRATION_TIMEOUT_MS" \
+                    docker "${DOCKER_CONFIG_FLAG[@]}" compose "${compose_args[@]}"; then
+                    return 1
+                fi
+            else
+                if ! sudo docker "${DOCKER_CONFIG_FLAG[@]}" compose "${compose_args[@]}"; then
+                    if [ -n "$env_backup" ] && ! cp -p "$env_backup" "$ENV_FILE"; then
+                        echo "Error: failed to restore .env after app startup failure" >&2
+                    fi
+                    rm -f "$env_backup" 2>/dev/null || true
+                    return 1
+                fi
+            fi
+        else
+            if [ "$use_env_override" = true ]; then
+                if ! MIGRATION_TIMEOUT_MS="$EFFECTIVE_MIGRATION_TIMEOUT_MS" \
+                    docker "${DOCKER_CONFIG_FLAG[@]}" compose "${compose_args[@]}"; then
+                    return 1
+                fi
+            else
+                if ! docker "${DOCKER_CONFIG_FLAG[@]}" compose "${compose_args[@]}"; then
+                    if [ -n "$env_backup" ] && ! cp -p "$env_backup" "$ENV_FILE"; then
+                        echo "Error: failed to restore .env after app startup failure" >&2
+                    fi
+                    rm -f "$env_backup" 2>/dev/null || true
+                    return 1
+                fi
+            fi
+        fi
+    else
+        if [ "$NEEDS_DOCKER_SUDO" = true ]; then
+            if [ "$use_env_override" = true ]; then
+                if ! sudo env MIGRATION_TIMEOUT_MS="$EFFECTIVE_MIGRATION_TIMEOUT_MS" \
+                    docker-compose "${compose_args[@]}"; then
+                    return 1
+                fi
+            else
+                if ! sudo docker-compose "${compose_args[@]}"; then
+                    if [ -n "$env_backup" ] && ! cp -p "$env_backup" "$ENV_FILE"; then
+                        echo "Error: failed to restore .env after app startup failure" >&2
+                    fi
+                    rm -f "$env_backup" 2>/dev/null || true
+                    return 1
+                fi
+            fi
+        else
+            if [ "$use_env_override" = true ]; then
+                if ! MIGRATION_TIMEOUT_MS="$EFFECTIVE_MIGRATION_TIMEOUT_MS" \
+                    docker-compose "${compose_args[@]}"; then
+                    return 1
+                fi
+            else
+                if ! docker-compose "${compose_args[@]}"; then
+                    if [ -n "$env_backup" ] && ! cp -p "$env_backup" "$ENV_FILE"; then
+                        echo "Error: failed to restore .env after app startup failure" >&2
+                    fi
+                    rm -f "$env_backup" 2>/dev/null || true
+                    return 1
+                fi
+            fi
+        fi
+    fi
+
+    if [ -n "$env_backup" ]; then
+        rm -f "$env_backup" 2>/dev/null || true
+    fi
+    return 0
+}
+
+sync_env_migration_timeout() {
+    local env_file="${ENV_FILE}"
+    local tmp_file
+
+    if [ ! -f "$env_file" ]; then
+        printf 'Error: .env file not found at: %s\n' "$env_file" >&2
+        return 1
+    fi
+    if [ ! -r "$env_file" ]; then
+        printf 'Error: .env file is not readable at: %s\n' "$env_file" >&2
+        return 1
+    fi
+    if [ ! -w "$env_file" ]; then
+        printf 'Error: .env file is not writable at: %s\n' "$env_file" >&2
+        return 1
+    fi
+
+    if ! tmp_file="$(mktemp "${env_file}.tmp.XXXXXX")"; then
+        printf 'Error: Failed to create temporary file for %s\n' "$env_file" >&2
+        return 1
+    fi
+    trap 'rm -f "$tmp_file" 2>/dev/null || true' RETURN
+
+    if ! awk '
+        /^[[:space:]]*#/ {
+            print
+            next
+        }
+        !/^[[:space:]]*(export[[:space:]]+)?MIGRATION_TIMEOUT_MS[[:space:]]*=/ {
+            print
+        }
+    ' "$env_file" > "$tmp_file"; then
+        rm -f "$tmp_file" 2>/dev/null || true
+        printf 'Error: Failed to read %s while syncing MIGRATION_TIMEOUT_MS\n' "$env_file" >&2
+        return 1
+    fi
+
+    if ! printf 'MIGRATION_TIMEOUT_MS=%s\n' "$EFFECTIVE_MIGRATION_TIMEOUT_MS" >> "$tmp_file"; then
+        rm -f "$tmp_file" 2>/dev/null || true
+        printf 'Error: Failed to append MIGRATION_TIMEOUT_MS to %s\n' "$tmp_file" >&2
+        return 1
+    fi
+
+    if ! chmod --reference="$env_file" "$tmp_file"; then
+        rm -f "$tmp_file" 2>/dev/null || true
+        printf 'Error: Failed to preserve permissions for %s\n' "$env_file" >&2
+        return 1
+    fi
+    chown --reference="$env_file" "$tmp_file" 2>/dev/null || true
+
+    if ! mv "$tmp_file" "$env_file"; then
+        rm -f "$tmp_file" 2>/dev/null || true
+        printf 'Error: Failed to update %s with MIGRATION_TIMEOUT_MS\n' "$env_file" >&2
+        return 1
+    fi
+    trap - RETURN
+
+    printf 'Synced MIGRATION_TIMEOUT_MS=%s to %s\n' "$EFFECTIVE_MIGRATION_TIMEOUT_MS" "$env_file"
 }
 
 # ============================================================
@@ -4183,6 +4332,15 @@ do_config_set() {
         echo "       Use only letters, digits, and these safe symbols: / . _ - : = + @ space" >&2
         return 1
     fi
+    case "$key" in
+        MIGRATION_TIMEOUT|HEALTH_TIMEOUT|DB_WAIT_TIMEOUT|MAX_SNAPSHOTS)
+            if [ -n "$value" ] && ! [[ "$value" =~ ^[0-9]+$ ]]; then
+                echo "Error: $key must be a non-negative integer (got: '$value')" >&2
+                echo "       Run '$0 --config-keys' for defaults, examples, and notes." >&2
+                return 1
+            fi
+            ;;
+    esac
 
     local cfg
     cfg=$(_config_write_path)
@@ -4195,7 +4353,6 @@ do_config_set() {
     fi
 
     local tmp="${cfg}.tmp.$$"
-    touch "$cfg" 2>/dev/null || true
     # Rewrite file: drop any existing line for this key, then append new value (if non-empty)
     {
         if [ -f "$cfg" ]; then
@@ -4211,6 +4368,102 @@ do_config_set() {
             echo "${key}=\"${value}\""
         fi
     } > "$tmp"
+
+    if [ "$key" = "MIGRATION_TIMEOUT" ]; then
+        local env_file="${ENV_FILE}"
+        local env_backup=""
+        local prev_timeout="${MIGRATION_TIMEOUT}"
+        local prev_effective_ms="${EFFECTIVE_MIGRATION_TIMEOUT_MS}"
+        local prev_effective_source="${EFFECTIVE_MIGRATION_TIMEOUT_MS_SOURCE}"
+        local new_timeout new_effective_ms new_effective_source
+
+        if [ ! -f "$env_file" ]; then
+            rm -f "$tmp" 2>/dev/null || true
+            printf 'Error: .env file not found at: %s\n' "$env_file" >&2
+            return 1
+        fi
+        if [ ! -r "$env_file" ]; then
+            rm -f "$tmp" 2>/dev/null || true
+            printf 'Error: .env file is not readable at: %s\n' "$env_file" >&2
+            return 1
+        fi
+        if [ ! -w "$env_file" ]; then
+            rm -f "$tmp" 2>/dev/null || true
+            printf 'Error: .env file is not writable at: %s\n' "$env_file" >&2
+            return 1
+        fi
+
+        if [ -n "$value" ]; then
+            new_timeout="$value"
+        else
+            new_timeout="900"
+        fi
+
+        if [ -n "${MIGRATION_TIMEOUT_MS_EXPLICIT:-}" ]; then
+            new_effective_ms="$MIGRATION_TIMEOUT_MS_EXPLICIT"
+            new_effective_source="environment"
+        else
+            new_effective_ms="$((new_timeout * 1000))"
+            new_effective_source="derived"
+        fi
+
+        if ! env_backup="$(mktemp "${env_file}.bak.XXXXXX")"; then
+            rm -f "$tmp" 2>/dev/null || true
+            printf 'Error: Failed to create backup for %s\n' "$env_file" >&2
+            return 1
+        fi
+        if ! cp -p "$env_file" "$env_backup"; then
+            rm -f "$tmp" 2>/dev/null || true
+            rm -f "$env_backup" 2>/dev/null || true
+            printf 'Error: Failed to back up %s\n' "$env_file" >&2
+            return 1
+        fi
+
+        MIGRATION_TIMEOUT="$new_timeout"
+        EFFECTIVE_MIGRATION_TIMEOUT_MS="$new_effective_ms"
+        EFFECTIVE_MIGRATION_TIMEOUT_MS_SOURCE="$new_effective_source"
+
+        local sync_output=""
+        if ! sync_output=$(sync_env_migration_timeout 2>&1); then
+            MIGRATION_TIMEOUT="$prev_timeout"
+            EFFECTIVE_MIGRATION_TIMEOUT_MS="$prev_effective_ms"
+            EFFECTIVE_MIGRATION_TIMEOUT_MS_SOURCE="$prev_effective_source"
+            rm -f "$tmp" 2>/dev/null || true
+            rm -f "$env_backup" 2>/dev/null || true
+            if [ -n "$sync_output" ]; then
+                printf '%s\n' "$sync_output" >&2
+            fi
+            return 1
+        fi
+
+        if ! mv "$tmp" "$cfg"; then
+            rm -f "$tmp" 2>/dev/null || true
+            if ! cp -p "$env_backup" "$env_file"; then
+                printf 'Error: Failed to restore %s after config write failure\n' "$env_file" >&2
+            fi
+            rm -f "$env_backup" 2>/dev/null || true
+            MIGRATION_TIMEOUT="$prev_timeout"
+            EFFECTIVE_MIGRATION_TIMEOUT_MS="$prev_effective_ms"
+            EFFECTIVE_MIGRATION_TIMEOUT_MS_SOURCE="$prev_effective_source"
+            echo "Error: could not write $cfg" >&2
+            return 1
+        fi
+        rm -f "$env_backup" 2>/dev/null || true
+
+        # Restrict permissions if it holds a key path
+        chmod 600 "$cfg" 2>/dev/null || true
+
+        if [ -z "$value" ]; then
+            log_ok "Removed ${key} from ${cfg}"
+        else
+            log_ok "Set ${key} in ${cfg}"
+        fi
+        if [ -n "$sync_output" ]; then
+            printf '%s\n' "$sync_output"
+        fi
+        echo "Applied config file: $cfg"
+        return 0
+    fi
 
     if ! mv "$tmp" "$cfg"; then
         rm -f "$tmp" 2>/dev/null || true
