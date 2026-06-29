@@ -9,6 +9,7 @@ The app writes one JSON-lines file per service into the container's `/var/log/pi
 ## Prerequisites
 
 - rsyslog **already installed and active**, version **≥ 8.25** (`rsyslogd -v`). This setup never installs rsyslog.
+- The **`acl`** package installed (`setfacl`/`getfacl`) so the setup can apply a umask-proof default ACL — `apt-get install -y acl`. Without it the mirror still works, but a service whose log is created *after* setup with a restrictive umask may not mirror (the script warns).
 - Phase-1 single-file JSON logging in effect (`/var/log/pico/cloudpi-*.log`).
 - Single host (container + rsyslog share the filesystem).
 - **The compose mount MUST be the absolute `/var/log/pico:/var/log/pico`** — NOT a relative `./logs/pico`. rsyslog's AppArmor profile only allows reads under `/var/log/**`; a relative mount lands the logs under the bundle dir (`/root/...`) where rsyslog is denied read and the mirror stays empty.
@@ -86,7 +87,8 @@ The app keeps writing its files unchanged; nothing tails them. No app change, no
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `verify-syslog.sh` → `FAIL readability` | `*.log` not readable by `syslog` (UID 1000) | `sudo ./setup-syslog.sh` (re-applies group + setgid) |
+| `verify-syslog.sh` → `FAIL readability` | `*.log` not readable by `syslog` (UID 1000) | `sudo ./setup-syslog.sh` (re-applies group + setgid + default ACL) |
+| Only SOME `*.log` mirror (e.g. `app.log` yes, `cloudpi-node.log` no) | a service created its log AFTER setup ran, with a restrictive umask → born `g-r`, so syslog can't read it (setgid fixes group, not the read bit) | install `acl` + `sudo ./setup-syslog.sh` (applies a umask-proof **default ACL**). If the script's step-5 readability check still names files, that writer forces mode `0600` — fix that service's log file mode/umask |
 | Nothing mirrored, no error | inotify unreliable on the bind mount | set `mode="polling" PollingInterval="1"` in the drop-in, restart rsyslog |
 | `setup-syslog.sh` aborts on version | rsyslog < 8.25 | uncomment the per-file fallback block in `30-cloudpi.conf` |
 | Lines also in `/var/log/syslog` | drop-in not loaded before defaults | confirm filename is `30-cloudpi.conf` and the ruleset ends with `stop` |

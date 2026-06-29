@@ -66,6 +66,25 @@ chmod -R u+rwX,g+rX,o-rwx "$PICO_HOST_DIR"
 chmod g+s "$PICO_HOST_DIR"
 note "set $PICO_HOST_DIR owner=$APP_UID group=$SYSLOG_GROUP (app writes, rsyslog reads)"
 
+# DURABLE READABILITY (the fix for "only some *.log mirror"): setgid above only
+# makes new files inherit the syslog GROUP — it does NOT set their read bit. A
+# service whose logger lazily creates its file AFTER this script runs (first log
+# line) with a restrictive umask is born g-r, so the priv-dropped rsyslog can't
+# tail it and that one file silently never mirrors. A DEFAULT ACL makes the
+# kernel ignore the writer's umask for the syslog group, so EVERY current and
+# future *.log is readable by rsyslog. Falls back to chmod-only (with a warning)
+# if the `acl` package / setfacl is unavailable.
+if command -v setfacl >/dev/null 2>&1; then
+    setfacl -R    -m g:"$SYSLOG_GROUP":rX "$PICO_HOST_DIR"   # existing dir + files
+    setfacl    -d -m g:"$SYSLOG_GROUP":rX "$PICO_HOST_DIR"   # default: inherited by NEW files
+    note "applied default ACL: '$SYSLOG_GROUP' reads existing + future *.log (umask-proof)"
+else
+    note "WARNING: setfacl not found (install the 'acl' package). Existing *.log are"
+    note "         readable, but a service that creates a NEW log after this run with a"
+    note "         restrictive umask may not mirror. Re-run after such files appear, or"
+    note "         install 'acl' for a permanent fix."
+fi
+
 # Dest: created if missing; group-writable by syslog so the priv-dropped rsyslog
 # can create the mirror files. A root-owned dir would silently mirror nothing.
 mkdir -p "$SYSLOG_DIR"
@@ -87,4 +106,24 @@ fi
 rm -f /tmp/rsyslog-validate.$$
 systemctl restart rsyslog
 note "validated and restarted rsyslog — mirror active: $PICO_HOST_DIR/*.log -> $SYSLOG_DIR/"
+
+# 5. Readability assertion — prove the priv-dropped rsyslog can actually READ
+#    every source *.log. This catches the silent-subset bug at install time: if
+#    a writer forces mode 0600 (defeats even the ACL mask), warn loudly and name
+#    the offenders instead of letting them never mirror. `sudo -u syslog test -r`
+#    checks access AS the exact identity rsyslog drops to.
+shopt -s nullglob
+unreadable=()
+for f in "$PICO_HOST_DIR"/*.log; do
+    sudo -u "$SYSLOG_USER" test -r "$f" 2>/dev/null || unreadable+=("$f")
+done
+if [ "${#unreadable[@]}" -gt 0 ]; then
+    note "WARNING: '$SYSLOG_USER' CANNOT read these files — they will NOT mirror:" >&2
+    printf '  - %s\n' "${unreadable[@]}" >&2
+    note "  their writer likely forces mode 0600 (defeats the ACL mask); fix that"
+    note "  service's log file mode/umask to be group-readable, then re-run." >&2
+else
+    note "readability OK — all $PICO_HOST_DIR/*.log are readable by '$SYSLOG_USER'"
+fi
+
 note "verify with: sudo $BUNDLE_DIR/verify-syslog.sh"
