@@ -45,19 +45,32 @@ No code in the app sends anything; no log program runs inside the container. The
 
 ## 5. How to set it up (quick version)
 
-```bash
-cd cloudpi
+**Step 0 — get the files: clone the repo from GitHub.** All four pieces (the rule, the two scripts, the docs) ship inside this repo, so once you clone it you have everything.
 
+```bash
+# Clone the bundle (first time) — gives you setup-syslog.sh, verify-syslog.sh,
+# host-config/30-cloudpi.conf, SYSLOG-RUNBOOK.md and this overview.
+git clone https://github.com/PurpleDataInc-TX/cloudpi.git
+cd cloudpi
+# Already cloned earlier? Just pull the latest instead:
+#   cd cloudpi && git pull origin main
+```
+
+Then run this flow:
+
+```bash
 # 1. Make the host log folder writable by the app (1000) and readable by rsyslog (syslog)
 sudo mkdir -p /var/log/pico && sudo chown -R 1000:syslog /var/log/pico && sudo chmod 2750 /var/log/pico
 
-# 2. Make sure compose uses the ABSOLUTE mount /var/log/pico:/var/log/pico, then:
+# 2. Make sure docker-compose.yml uses the ABSOLUTE mount /var/log/pico:/var/log/pico, then:
 docker compose up -d
 
 # 3. Install + verify the syslog rule
-sudo ./setup-syslog.sh
+sudo ./setup-syslog.sh         # creates folders, sets perms, installs the rule, restarts rsyslog
 sudo ./verify-syslog.sh        # should end with: PASS
 ```
+
+That's the whole flow: **clone → run the three commands → done.**
 
 ## 6. How to check it's actually working
 
