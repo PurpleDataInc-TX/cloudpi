@@ -4,25 +4,31 @@ One-page guide to mirror CloudPi's JSON logs into `/var/log/cloudpi/` using the 
 
 ## What this does
 
-The app writes one JSON-lines file per service into the container's `/var/log/pico/`, bind-mounted to the host (`./logs/pico:/var/log/pico`). The host rsyslog **tails every `*.log`** with one `imfile` wildcard input and **mirrors each file verbatim** into `/var/log/cloudpi/<same-name>`. No daemon runs in the container; the app opens no socket.
+The app writes one JSON-lines file per service into the container's `/var/log/pico/`, bind-mounted to the host (`/var/log/pico:/var/log/pico`). The host rsyslog **tails every `*.log`** with one `imfile` wildcard input and **mirrors each file verbatim** into `/var/log/cloudpi/<same-name>`. No daemon runs in the container; the app opens no socket.
 
 ## Prerequisites
 
 - rsyslog **already installed and active**, version **≥ 8.25** (`rsyslogd -v`). This setup never installs rsyslog.
-- `/var/log/cloudpi/` already exists.
 - Phase-1 single-file JSON logging in effect (`/var/log/pico/cloudpi-*.log`).
 - Single host (container + rsyslog share the filesystem).
+- **The compose mount MUST be the absolute `/var/log/pico:/var/log/pico`** — NOT a relative `./logs/pico`. rsyslog's AppArmor profile only allows reads under `/var/log/**`; a relative mount lands the logs under the bundle dir (`/root/...`) where rsyslog is denied read and the mirror stays empty.
 
 ## Procedure
 
 ```bash
 cd cloudpi
-docker compose up -d                 # populates ./logs/pico with cloudpi-*.log
-sudo ./setup-syslog.sh               # perms fix + install drop-in + validate + restart
+
+# 1. Pre-create the host log dir so the app (UID 1000) can WRITE and syslog can READ.
+#    MUST run BEFORE `compose up`, or the bind mount overrides the image dir as
+#    root-owned and the app crashes: PermissionError: /var/log/pico/app.log
+sudo mkdir -p /var/log/pico && sudo chown -R 1000:syslog /var/log/pico && sudo chmod 2750 /var/log/pico
+
+docker compose up -d                 # app writes /var/log/pico/cloudpi-*.log
+sudo ./setup-syslog.sh               # creates dirs + perms, installs drop-in, validates, restarts
 sudo ./verify-syslog.sh              # end-to-end PASS/FAIL
 ```
 
-`setup-syslog.sh` is idempotent: asserts rsyslog active + ≥ 8.25, makes `./logs/pico` group-readable by `syslog` (the UID-1000 fix: `chgrp syslog` + `chmod g+r` + setgid), copies `host-config/30-cloudpi.conf` to `/etc/rsyslog.d/`, runs `rsyslogd -N1`, and restarts rsyslog only if valid.
+`setup-syslog.sh` is idempotent: asserts rsyslog active + ≥ 8.25; creates `/var/log/pico` (`chown 1000:syslog`, `chmod 2750` — app writes, syslog reads) and `/var/log/cloudpi` (group `syslog`, writable so the priv-dropped rsyslog can create the mirror files); copies `host-config/30-cloudpi.conf` to `/etc/rsyslog.d/`; runs `rsyslogd -N1`; and restarts rsyslog only if valid.
 
 ## Read the logs
 
@@ -40,7 +46,7 @@ Files are plain JSON-lines — `less`, `awk`, `jq` all work.
 |---|---|---|
 | Wildcard tail | `30-cloudpi.conf` `File="/var/log/pico/*.log"` | auto-discovers new files; excludes rotated `*.log.N` |
 | Watch mode | `module(load="imfile" mode=...)` | **`polling` (1s) is the default** — safe on the bind mount. Switch to `mode="inotify"` only if `/var/log/pico` is a local FS |
-| Source perms (UID-1000) | `setup-syslog.sh` | `chgrp syslog` + `chmod g+r` + setgid on `./logs/pico` so rsyslog (priv-dropped to `syslog`) can READ |
+| Source perms (UID-1000) | `setup-syslog.sh` | `chgrp syslog` + `chmod g+r` + setgid on `/var/log/pico` so rsyslog (priv-dropped to `syslog`) can READ |
 | Dest perms | `setup-syslog.sh` | `chgrp syslog` + `g+rwx` + setgid on `/var/log/cloudpi` so the priv-dropped rsyslog can WRITE the mirror |
 | Exactly-once | (automatic) | no static `StateFile` on the wildcard input; rsyslog auto-manages per-file state across restarts |
 | Stay out of syslog | dedicated ruleset + `stop` | CloudPi lines never land in `/var/log/syslog` |
