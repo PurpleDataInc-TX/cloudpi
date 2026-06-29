@@ -68,10 +68,17 @@ services:
       HOST: ${HOST:-localhost}
       OPENBLAS_NUM_THREADS: "1"
       OMP_NUM_THREADS: "1"
+      # Both services write their single JSON log here so host rsyslog can tail
+      # /var/log/pico/*.log (spec 116). Flask reads this already; Node now honors
+      # LOGS_BASE_DIR too (src/utils/logger.ts + frontendLogger.ts).
+      LOGS_BASE_DIR: /var/log/pico
     volumes:
       - redis_data:/var/lib/redis
       - ./certs:/home/certs
       - cloudpi:/app/backups
+      # Expose the JSON log dir to the host so the pre-installed rsyslog can tail it.
+      # Files are written as UID 1000; the host `syslog` user must be able to read them.
+      - ./logs/pico:/var/log/pico
     security_opt:
       - no-new-privileges:true
     deploy:
