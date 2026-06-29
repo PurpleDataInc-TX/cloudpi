@@ -4,9 +4,10 @@
 #
 # Idempotent host-side installer. Assumes rsyslog is ALREADY installed and
 # active (>= 8.25); it NEVER installs rsyslog. It:
-#   1. asserts rsyslog active + >= 8.25 and /var/log/cloudpi exists
-#   2. makes the bind-mount source dir readable by the host `syslog` user
-#      (the UID-1000 fix: group ownership + group-read + setgid)
+#   1. asserts rsyslog active + >= 8.25
+#   2. creates /var/log/pico (owner app UID, group syslog) and /var/log/cloudpi
+#      (group syslog, writable) — both under /var/log so AppArmor permits rsyslog
+#      to read the source and write the mirror
 #   3. copies host-config/30-cloudpi.conf -> /etc/rsyslog.d/
 #   4. validates with `rsyslogd -N1` and restarts rsyslog (only if valid)
 #
@@ -18,10 +19,14 @@ set -euo pipefail
 BUNDLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DROPIN_SRC="$BUNDLE_DIR/host-config/30-cloudpi.conf"
 DROPIN_DST="/etc/rsyslog.d/30-cloudpi.conf"
-PICO_HOST_DIR="${PICO_HOST_DIR:-$BUNDLE_DIR/logs/pico}"   # host side of ./logs/pico:/var/log/pico
+# Host path of the app's log dir. MUST be under /var/log (rsyslog's AppArmor
+# profile only permits reads under /var/log/**), and MUST match the compose
+# bind mount (/var/log/pico:/var/log/pico) and the drop-in's File= path.
+PICO_HOST_DIR="${PICO_HOST_DIR:-/var/log/pico}"
 SYSLOG_DIR="${SYSLOG_DIR:-/var/log/cloudpi}"
+APP_UID="${APP_UID:-1000}"             # container app user — WRITES the source logs
 SYSLOG_USER="${SYSLOG_USER:-syslog}"   # rsyslog priv-drop user (reads source)
-SYSLOG_GROUP="${SYSLOG_GROUP:-syslog}" # rsyslog priv-drop group (writes dest)
+SYSLOG_GROUP="${SYSLOG_GROUP:-syslog}" # rsyslog priv-drop group (reads source, writes dest)
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 note() { echo "[setup-syslog] $*"; }
@@ -41,26 +46,33 @@ if [ "$major" -lt 8 ] || { [ "$major" -eq 8 ] && [ "$minor" -lt 25 ]; }; then
 fi
 note "rsyslog $ver active (>= 8.25 OK)"
 
-# 2. Preconditions + permissions for the priv-dropped rsyslog ----------------
-# rsyslog drops privileges to $SYSLOG_USER/$SYSLOG_GROUP ($PrivDropToUser), so it
-# READS the source and WRITES the dest as that user — both must be accessible.
-[ -d "$SYSLOG_DIR" ] || die "$SYSLOG_DIR does not exist — it is assumed pre-created (this script does not create it)"
+# 2. Create dirs + permissions ------------------------------------------------
+# /var/log/pico has TWO stakeholders: the container app (UID $APP_UID) WRITES it,
+# and the priv-dropped rsyslog ($SYSLOG_USER/$SYSLOG_GROUP, per $PrivDropToUser)
+# READS it. The mirror dest must be WRITABLE by rsyslog. Both MUST be under
+# /var/log — rsyslog's AppArmor profile denies reads outside /var/log/**.
 getent group  "$SYSLOG_GROUP" >/dev/null || die "host group '$SYSLOG_GROUP' not found (rsyslog priv-drop group)"
 getent passwd "$SYSLOG_USER"  >/dev/null || die "host user '$SYSLOG_USER' not found (rsyslog priv-drop user)"
+case "$PICO_HOST_DIR" in
+    /var/log/*) : ;;
+    *) echo "[setup-syslog] WARNING: $PICO_HOST_DIR is outside /var/log — rsyslog's AppArmor profile will DENY reads there; the mirror will be empty. Use an absolute /var/log path." >&2 ;;
+esac
 
-# Source (UID-1000 fix): readable by the syslog group; setgid so new *.log inherit it.
+# Source: owned by the app UID (container can write), group syslog (rsyslog can
+# read), setgid so new *.log inherit the syslog group; no access for others.
 mkdir -p "$PICO_HOST_DIR"
-chgrp -R "$SYSLOG_GROUP" "$PICO_HOST_DIR"
-chmod -R g+rX "$PICO_HOST_DIR"
+chown -R "$APP_UID:$SYSLOG_GROUP" "$PICO_HOST_DIR"
+chmod -R u+rwX,g+rX,o-rwx "$PICO_HOST_DIR"
 chmod g+s "$PICO_HOST_DIR"
-note "made $PICO_HOST_DIR group-readable by '$SYSLOG_GROUP' (setgid set)"
+note "set $PICO_HOST_DIR owner=$APP_UID group=$SYSLOG_GROUP (app writes, rsyslog reads)"
 
-# Dest: WRITABLE by the syslog group so the priv-dropped rsyslog can create the
-# mirror files. Without this, a root-owned /var/log/cloudpi silently mirrors nothing.
+# Dest: created if missing; group-writable by syslog so the priv-dropped rsyslog
+# can create the mirror files. A root-owned dir would silently mirror nothing.
+mkdir -p "$SYSLOG_DIR"
 chgrp "$SYSLOG_GROUP" "$SYSLOG_DIR"
 chmod g+rwx "$SYSLOG_DIR"
 chmod g+s   "$SYSLOG_DIR"
-note "made $SYSLOG_DIR group-writable by '$SYSLOG_GROUP' (rsyslog priv-drop target)"
+note "ensured $SYSLOG_DIR exists, group-writable by '$SYSLOG_GROUP' (rsyslog priv-drop target)"
 
 # 3. Install the drop-in ------------------------------------------------------
 install -m 0644 "$DROPIN_SRC" "$DROPIN_DST"

@@ -77,8 +77,13 @@ services:
       - ./certs:/home/certs
       - cloudpi:/app/backups
       # Expose the JSON log dir to the host so the pre-installed rsyslog can tail it.
-      # Files are written as UID 1000; the host `syslog` user must be able to read them.
-      - ./logs/pico:/var/log/pico
+      # MUST be an absolute /var/log path: rsyslog's AppArmor profile only allows
+      # reads under /var/log/** (NOT /root or /home), so a relative ./logs/pico
+      # (which resolves under the bundle dir, e.g. /root/...) would be unreadable
+      # by rsyslog. Pre-create on the host so the app (UID 1000) can WRITE and the
+      # host `syslog` user can READ:
+      #   mkdir -p /var/log/pico && chown -R 1000:syslog /var/log/pico && chmod 2750 /var/log/pico
+      - /var/log/pico:/var/log/pico
     security_opt:
       - no-new-privileges:true
     deploy:
