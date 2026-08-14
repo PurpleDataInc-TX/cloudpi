@@ -72,6 +72,12 @@ services:
       # /var/log/pico/*.log (spec 116). Flask reads this already; Node now honors
       # LOGS_BASE_DIR too (src/utils/logger.ts + frontendLogger.ts).
       LOGS_BASE_DIR: /var/log/pico
+      # Frozen PyInstaller Flask: its OpenSSL looks for CAs at a build-time path
+      # that doesn't exist in the container, so Databricks (and any HTTPS) calls
+      # fail with CERTIFICATE_VERIFY_FAILED. Point it at the image's CA bundle.
+      # (tracker/2026-07-09/databricks-ssl-frozen-openssl-trust-store)
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      SSL_CERT_DIR: /etc/ssl/certs
     volumes:
       - redis_data:/var/lib/redis
       - ./certs:/home/certs
