@@ -21,6 +21,7 @@ CloudPi is a cloud cost governance and management platform designed for deployme
 - `setup-keyvault-secrets.sh`: Azure Key Vault integration setup with Managed Identity
 - `fetch-secrets.sh`: Script to fetch secrets from Azure Key Vault to tmpfs
 - `setup-docker-compose-service.sh`: Systemd service creation for auto-start on boot
+- `setup-lambda.sh`: Optional, AWS only: moves billing ingestion to an AWS Lambda function in your own account; see `LAMBDA-INGESTION.md`
 - `certs/`: Directory for SSL certificates (created by setup-certbot.sh)
 - `.gitignore`: Excludes sensitive files (certificates, secrets, fetch-secrets.sh)
 

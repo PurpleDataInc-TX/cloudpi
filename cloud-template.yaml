@@ -36,11 +36,19 @@ Parameters:
     Default: ''
     Description: OPTIONAL - Base domain name (required if HTTPS=true)
 
+  EnableLambdaIngestion:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: OPTIONAL - 'true' prepares this stack for setup-lambda.sh (Lambda ingestion in your own AWS account, see the cloudpi README) - gives the server an IAM role, lets its containers reach it, and creates the security group the function runs in. 'false' changes nothing.
+
 Conditions:
   CreateSubdomain: !And 
     - !Equals [!Ref HTTPSEnabled, 'true']
     - !Not [!Equals [!Ref HostedZoneId, '']]
     - !Not [!Equals [!Ref DomainName, '']]
+
+  LambdaEnabled: !Equals [!Ref EnableLambdaIngestion, 'true']
 
 Resources:
 
@@ -171,6 +179,47 @@ Resources:
           ToPort: 6379
           CidrIp: 0.0.0.0/0
 
+  # ---- Lambda ingestion (only when EnableLambdaIngestion is 'true'; see setup-lambda.sh) ----------------------------------------------------
+  # The security group the Lambda function runs in: no inbound rules. It may reach the CloudPi database below, and nothing else is opened.
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: LambdaEnabled
+    Properties:
+      GroupDescription: CloudPi Lambda ingestion function (no inbound rules)
+      VpcId: !Ref VPC
+
+  # MySQL from the function only. (InstanceSecurityGroup above still opens 3306 to 0.0.0.0/0: restrict that rule to your own addresses.)
+  MySqlFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: LambdaEnabled
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: CloudPi Lambda ingestion function to MySQL
+
+  # The server's AWS identity. It starts with no permissions: setup-lambda.sh --instance-role attaches the one policy CloudPi needs.
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Condition: LambdaEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: LambdaEnabled
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
   # Elastic IP Allocation
   ElasticIP:
     Type: AWS::EC2::EIP
@@ -198,6 +247,14 @@ Resources:
       InstanceType: !Ref InstanceType
       KeyName: !Ref KeyName
       ImageId: !Ref AMIID
+      IamInstanceProfile: !If [LambdaEnabled, !Ref InstanceProfile, !Ref 'AWS::NoValue']
+      # Containers sit one network hop behind the instance, and the default hop limit of 1 hides the instance role from them.
+      MetadataOptions: !If
+        - LambdaEnabled
+        - HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        - !Ref 'AWS::NoValue'
       NetworkInterfaces:
         - AssociatePublicIpAddress: 'true'
           DeviceIndex: 0
@@ -243,6 +300,24 @@ Outputs:
   EC2InstancePublicIP:
     Description: Public IP of the CloudPi EC2 instance
     Value: !GetAtt EC2Instance.PublicIp
+
+  # What setup-lambda.sh asks for (only when EnableLambdaIngestion is 'true')
+  LambdaSubnetIds:
+    Condition: LambdaEnabled
+    Description: --subnets for setup-lambda.sh (two Availability Zones)
+    Value: !Join [',', [!Ref Subnet1, !Ref Subnet2]]
+  LambdaSecurityGroupId:
+    Condition: LambdaEnabled
+    Description: --security-group for setup-lambda.sh
+    Value: !Ref LambdaSecurityGroup
+  InstanceRoleName:
+    Condition: LambdaEnabled
+    Description: --instance-role for setup-lambda.sh
+    Value: !Ref InstanceRole
+  DatabaseHost:
+    Condition: LambdaEnabled
+    Description: The server's private address, for the database URL in the Secrets Manager secret (port 3306)
+    Value: !GetAtt EC2Instance.PrivateIp
 
 
 

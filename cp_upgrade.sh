@@ -2658,6 +2658,30 @@ wait_for_healthy() {
 # ============================================================
 # Deploy
 # ============================================================
+# ============================================================
+# Lambda ingestion (optional, see setup-lambda.sh)
+# ============================================================
+# When the Lambda ingestion is installed on this server, it moves to the same release as the app. This runs only after the app is healthy on
+# the new tag, so an upgrade that failed and was rolled back by this script never touches the Lambda. Nothing changes for a customer who has not
+# installed it (no .cloudpi-lambda.state). A failure here does not undo the app upgrade: the app keeps running; collections on Lambda fail until
+# the Lambda matches, so the message says how to retry or to collect on this server meanwhile.
+lambda_follow() {
+    local tag="$1"
+    [ -f "${SCRIPT_DIR}/.cloudpi-lambda.state" ] || return 0
+    if [ ! -x "${SCRIPT_DIR}/setup-lambda.sh" ]; then
+        log_warn "Lambda ingestion is installed but ${SCRIPT_DIR}/setup-lambda.sh is missing or not executable: the Lambda was not moved to ${tag}"
+        return 0
+    fi
+    log_info "Moving the Lambda ingestion to release ${tag}..."
+    if "${SCRIPT_DIR}/setup-lambda.sh" follow "$tag" --yes; then
+        log_ok "Lambda ingestion is on release ${tag}"
+    else
+        log_warn "The Lambda ingestion could not be moved to ${tag}: the app is upgraded and healthy, but its Lambda is the previous release."
+        log_warn "  Retry:  ${SCRIPT_DIR}/setup-lambda.sh follow ${tag}      Or collect on this server meanwhile:  ${SCRIPT_DIR}/setup-lambda.sh local"
+    fi
+    return 0
+}
+
 do_deploy() {
     local new_tag=$1
     DEPLOY_IN_PROGRESS=true
@@ -2881,6 +2905,8 @@ do_deploy() {
     echo "  Rollback available: ${current_tag:-none}"
     echo "=========================================="
     echo ""
+
+    lambda_follow "$new_tag"
 }
 
 # ============================================================
@@ -3306,6 +3332,8 @@ do_rollback() {
     fi
 
     do_rollback_internal "$rollback_tag" "Manual rollback requested"
+    # Only reached when the rollback succeeded (set -e ends the script otherwise): the Lambda follows the app back.
+    lambda_follow "$rollback_tag"
 }
 
 # ============================================================
@@ -3797,6 +3825,8 @@ do_restore() {
     echo "  DB:   ${DOCKER_REPOSITORY}:${snap_db_tag}"
     echo "=========================================="
     echo ""
+
+    lambda_follow "$snap_app_tag"
 }
 
 # ============================================================
