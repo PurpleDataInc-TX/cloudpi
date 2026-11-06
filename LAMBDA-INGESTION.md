@@ -59,14 +59,15 @@ database inside the private network the function runs in (the security-group rul
 
 ```
 cd cloudpi
-./setup-lambda.sh install --dry-run --release 1.5.0 --orgs 12,15 --subnets subnet-0a1,subnet-0b2 --security-group sg-0123abcd \
+./setup-lambda.sh install --dry-run --release 1.5.0 --subnets subnet-0a1,subnet-0b2 --security-group sg-0123abcd \
     --database-secret-arn arn:aws:secretsmanager:us-east-1:111122223333:secret:cloudpi-db-AbCd      # shows what would happen, changes nothing
-./setup-lambda.sh install --release 1.5.0 --orgs 12,15 --subnets subnet-0a1,subnet-0b2 --security-group sg-0123abcd \
+./setup-lambda.sh install --release 1.5.0 --subnets subnet-0a1,subnet-0b2 --security-group sg-0123abcd \
     --database-secret-arn arn:aws:secretsmanager:us-east-1:111122223333:secret:cloudpi-db-AbCd \
     --instance-role <the AWS role of this server>
 ```
 
-`--orgs` is required: no org moves to Lambda unless you name it (`all` moves every org). Start with one.
+There is no list of orgs to give: choosing the Lambda path moves the billing collection of every org to it (the script writes `INGEST_LAMBDA_ORGS=all`
+into the `.env` block). To go back to this server for every org, run `./setup-lambda.sh local`.
 
 It does, in order: checks the release files and your AWS identity, verifies the bundle's SHA-256, creates a private encrypted bucket (job files
 expire after 7 days) and uploads the bundle, creates a CloudFormation role and the policy CloudPi needs (stack `cloudpi-lambda-deployer`),
