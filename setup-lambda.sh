@@ -5,7 +5,7 @@
 # Moves CloudPi's billing ingestion (Order 1) from this server onto AWS Lambda Managed Instances, in YOUR AWS account, and back.
 # Nothing changes for you until you run `install`; without it CloudPi keeps collecting on this server (INGEST_INVOKER=local).
 #
-#   ./setup-lambda.sh install --release 1.5.0 --orgs 12,15 --subnets subnet-a,subnet-b --security-group sg-x --database-secret-arn arn:aws:secretsmanager:...
+#   ./setup-lambda.sh install --release 1.5.0 --subnets subnet-a,subnet-b --security-group sg-x --database-secret-arn arn:aws:secretsmanager:...
 #   ./setup-lambda.sh upgrade 1.6.0   # the Lambda moves to another release (cp_upgrade.sh does this for you, see "follow")
 #   ./setup-lambda.sh local           # collect on this server again (the Lambda stays, switched off)
 #   ./setup-lambda.sh lambda          # collect on Lambda again, with the settings of the last install
@@ -41,7 +41,7 @@ WORKDIR=""
 trap '[ -z "$WORKDIR" ] || rm -rf "$WORKDIR"' EXIT
 
 # The settings of one install. They are script-level so that install, upgrade and follow run the same steps below.
-ORGS="" SUBNETS="" SG="" SECRET="" REGION="${AWS_REGION:-}" BUCKET="" STACK="cloudpi-lambda" FUNCTION="cloudpi-dlt-ingest"
+SUBNETS="" SG="" SECRET="" REGION="${AWS_REGION:-}" BUCKET="" STACK="cloudpi-lambda" FUNCTION="cloudpi-dlt-ingest"
 INSTANCE_ROLE="" USE_ROLE=true DB_SG="" RELEASE=""
 ACCOUNT="" BUNDLE_SHA="" BUNDLE_PATH="" ROLE_ARGS=()
 
@@ -57,7 +57,7 @@ usage() {
 Usage: ./setup-lambda.sh <command> [options]
 
 Commands
-  install        create the Lambda in your AWS account and switch the listed orgs' collection to it
+  install        create the Lambda in your AWS account and switch the billing collection of every org to it
   upgrade <tag>  move the Lambda to the release <tag> (the CloudPi image tag); refuses while a collection is running on it
   follow <tag>   what cp_upgrade.sh runs after the app is healthy on <tag>: upgrade if the Lambda is installed, nothing if it is not
   local          switch collection back to this server (keeps the Lambda, switched off)
@@ -66,7 +66,6 @@ Commands
 
 install options
   --release <tag>                the release to install (the CloudPi image tag). Without it the files already in ./lambda are used.
-  --orgs <ids|all>               REQUIRED. Org ids that collect on Lambda, e.g. 12,15, or "all". No org moves unless you name it.
   --subnets <a,b>                REQUIRED. Two subnets in different Availability Zones, e.g. subnet-0a1,subnet-0b2
   --security-group <sg-id>       REQUIRED. No inbound rules; outbound to S3, Secrets Manager and your database
   --database-secret-arn <arn>    REQUIRED. Secrets Manager secret whose value is the MySQL URL the function connects with
@@ -148,8 +147,8 @@ assemble_bundle() {
 
 # -- .env and the saved settings ------------------------------------------------------------------------------------------------------
 BACKED_UP=false
-write_env_block() {  # write_env_block <invoker> <function> <bucket> <orgs> <region>
-    local invoker="$1" fn="$2" bucket="$3" orgs="$4" region="$5" tmp
+write_env_block() {  # write_env_block <invoker> <function> <bucket> <region>
+    local invoker="$1" fn="$2" bucket="$3" region="$4" tmp
     tmp="$(mktemp)"
     if [ -f "$ENV_FILE" ]; then
         awk -v b="$BEGIN_MARK" -v e="$END_MARK" '$0==b{skip=1;next} $0==e{skip=0;next} !skip' "$ENV_FILE" > "$tmp"
@@ -167,7 +166,7 @@ $clash"
         echo "INGEST_INVOKER=$invoker"
         echo "INGEST_LAMBDA_FUNCTION=$fn"
         echo "INGEST_LAMBDA_BUCKET=$bucket"
-        echo "INGEST_LAMBDA_ORGS=$orgs"
+        echo "INGEST_LAMBDA_ORGS=all"       # choosing the Lambda path moves every org; PiFlask sends none unless a list or "all" is set
         echo "AWS_REGION=$region"
         echo "$END_MARK"
     } >> "$tmp"
@@ -185,12 +184,18 @@ $clash"
     rm -f "$tmp"
 }
 
+# SHA-256 of the two templates of the downloaded release (function stack, then service-role stack). A release can change only these (the loader
+# is inline in the template, and so are the IAM policy, memory and timeout) and keep the same bundle, so the upgrade compares both.
+templates_sha() {
+    cat "$LAMBDA_DIR/template.yaml" "$LAMBDA_DIR/service-role.yaml" | sha256sum | cut -d' ' -f1
+}
+
 # Ids and names only, never a secret: what an upgrade needs to deploy the same stack again.
 save_state() {
     if $DRY_RUN; then return 0; fi
     local tmp; tmp="$(mktemp)"
-    printf '%s\n' "STACK=$STACK" "FUNCTION=$FUNCTION" "BUCKET=$BUCKET" "ORGS=$ORGS" "REGION=$REGION" "RELEASE=${RELEASE:-unknown}" \
-        "BUNDLE_SHA256=$BUNDLE_SHA" "SUBNETS=$SUBNETS" "SG=$SG" "SECRET=$SECRET" \
+    printf '%s\n' "STACK=$STACK" "FUNCTION=$FUNCTION" "BUCKET=$BUCKET" "REGION=$REGION" "RELEASE=${RELEASE:-unknown}" \
+        "BUNDLE_SHA256=$BUNDLE_SHA" "TEMPLATES_SHA256=$(templates_sha)" "SUBNETS=$SUBNETS" "SG=$SG" "SECRET=$SECRET" \
         "USE_ROLE=$USE_ROLE" "INSTANCE_ROLE=$INSTANCE_ROLE" "DB_SG=$DB_SG" > "$tmp"
     cat "$tmp" > "$STATE_FILE"
     rm -f "$tmp"
@@ -200,12 +205,12 @@ state_get() {
 }
 load_state() {
     [ -f "$STATE_FILE" ] || die "no Lambda settings saved ($STATE_FILE): run ./setup-lambda.sh install first"
-    STACK="$(state_get STACK)"; FUNCTION="$(state_get FUNCTION)"; BUCKET="$(state_get BUCKET)"; ORGS="$(state_get ORGS)"
+    STACK="$(state_get STACK)"; FUNCTION="$(state_get FUNCTION)"; BUCKET="$(state_get BUCKET)"
     REGION="$(state_get REGION)"; SUBNETS="$(state_get SUBNETS)"; SG="$(state_get SG)"; SECRET="$(state_get SECRET)"
     USE_ROLE="$(state_get USE_ROLE)"
     INSTANCE_ROLE="$(state_get INSTANCE_ROLE)"; DB_SG="$(state_get DB_SG)"
     [ "${#STACK}" -le 24 ] || die "the stack name '$STACK' (saved in $STATE_FILE) is longer than the 24 characters this release's deploy role supports (its permissions name the stack's IAM roles, which CloudFormation shortens for longer stack names). Install again under a shorter --stack name"
-    if [ -z "$STACK" ] || [ -z "$FUNCTION" ] || [ -z "$BUCKET" ] || [ -z "$ORGS" ] || [ -z "$REGION" ] || [ -z "$SUBNETS" ] || [ -z "$SG" ] || [ -z "$SECRET" ]; then
+    if [ -z "$STACK" ] || [ -z "$FUNCTION" ] || [ -z "$BUCKET" ] || [ -z "$REGION" ] || [ -z "$SUBNETS" ] || [ -z "$SG" ] || [ -z "$SECRET" ]; then
         die "$STATE_FILE is incomplete (an install made by an older setup-lambda.sh?): run ./setup-lambda.sh install again"
     fi
     [ -n "$USE_ROLE" ] || USE_ROLE=true
@@ -365,7 +370,6 @@ cmd_install() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --release) RELEASE="${2:-}"; shift 2;;
-            --orgs) ORGS="${2:-}"; shift 2;;
             --subnets) SUBNETS="${2:-}"; shift 2;;
             --security-group) SG="${2:-}"; shift 2;;
             --database-secret-arn) SECRET="${2:-}"; shift 2;;
@@ -382,7 +386,6 @@ cmd_install() {
             *) die "unknown option $1 (see ./setup-lambda.sh --help)";;
         esac
     done
-    check_value --orgs "$ORGS" '^(all|[0-9]+(,[0-9]+)*)$' "12,15 or all"
     check_value --subnets "$SUBNETS" '^subnet-[0-9a-f]+(,subnet-[0-9a-f]+)+$' "subnet-0a1,subnet-0b2 (two or more)"
     check_value --security-group "$SG" '^sg-[0-9a-f]+$' "sg-0123abcd"
     # Never print this value back: a customer may have pasted the MySQL URL, with its password, where the secret's ARN belongs.
@@ -434,12 +437,12 @@ cmd_install() {
     switch_function_off
 
     log_step "Step 8: Pointing CloudPi at the function..."
-    write_env_block lambda "$FUNCTION" "$BUCKET" "$ORGS" "$REGION"
+    write_env_block lambda "$FUNCTION" "$BUCKET" "$REGION"
     save_state
     recreate_app
 
     echo
-    log_info "Done. Orgs collecting on Lambda: $ORGS"
+    log_info "Done. Billing collection of every org runs on Lambda."
     log_info "Back to this server at any time: ./setup-lambda.sh local"
 }
 
@@ -465,8 +468,9 @@ cmd_upgrade() {
     check_release_files
     verify_bundle
     check_aws_identity
-    if [ "$BUNDLE_SHA" = "$(state_get BUNDLE_SHA256)" ]; then
-        log_info "the Lambda already runs this bundle (release $(state_get RELEASE)): nothing to deploy"
+    # An install made before TEMPLATES_SHA256 was recorded has none, so it deploys once (CloudFormation reports "no changes" if there are none).
+    if [ "$BUNDLE_SHA" = "$(state_get BUNDLE_SHA256)" ] && [ "$(templates_sha)" = "$(state_get TEMPLATES_SHA256)" ]; then
+        log_info "the Lambda already runs this bundle and these templates (release $(state_get RELEASE)): nothing to deploy"
         if [ "$(state_get RELEASE)" != "$tag" ]; then save_state; fi
         return 0
     fi
@@ -501,7 +505,7 @@ cmd_upgrade() {
     switch_function_off
     save_state
     echo
-    log_info "Done. The Lambda is on release $tag. Orgs collecting on it: $ORGS"
+    log_info "Done. The Lambda is on release $tag."
 }
 
 cmd_follow() {
@@ -525,16 +529,24 @@ switch_mode() {  # switch_mode <invoker> [options]
         esac
     done
     [ -f "$STATE_FILE" ] || die "no Lambda settings saved ($STATE_FILE): run ./setup-lambda.sh install first"
-    local fn bucket orgs region
-    fn="$(state_get FUNCTION)"; bucket="$(state_get BUCKET)"; orgs="$(state_get ORGS)"; region="$(state_get REGION)"
-    if [ -z "$fn" ] || [ -z "$bucket" ] || [ -z "$orgs" ] || [ -z "$region" ]; then die "$STATE_FILE is incomplete: run ./setup-lambda.sh install again"; fi
+    local fn bucket region
+    fn="$(state_get FUNCTION)"; bucket="$(state_get BUCKET)"; region="$(state_get REGION)"
+    if [ -z "$fn" ] || [ -z "$bucket" ] || [ -z "$region" ]; then die "$STATE_FILE is incomplete: run ./setup-lambda.sh install again"; fi
     need_tool docker
-    write_env_block "$mode" "$fn" "$bucket" "$orgs" "$region"
+    write_env_block "$mode" "$fn" "$bucket" "$region"
     recreate_app
     if [ "$mode" = "local" ]; then
+        # A collection that was running when CloudPi stopped leaves the machines switched on, and nothing starts them off again once
+        # CloudPi no longer uses the function: switch them off here, so they do not bill.
+        FUNCTION="$fn"; REGION="$region"
+        if command -v aws > /dev/null 2>&1; then
+            switch_function_off || log_warn "could not switch the Lambda ($fn) off: run  aws lambda put-function-scaling-config --function-name $fn --qualifier '\$LATEST.PUBLISHED' --function-scaling-config MinExecutionEnvironments=0,MaxExecutionEnvironments=0 --region $region"
+        else
+            log_warn "the aws CLI is not installed, so the Lambda ($fn) was not switched off: do it from the console or with the AWS CLI if a collection was running"
+        fi
         log_info "Collection runs on this server again. The Lambda ($fn) stays in your account, switched off."
     else
-        log_info "Collection runs on Lambda again for: $orgs"
+        log_info "Billing collection of every org runs on Lambda again."
     fi
 }
 
@@ -545,7 +557,7 @@ cmd_status() {
     if [ -f "$STATE_FILE" ]; then
         echo "release:   $(state_get RELEASE)"
         echo "stack:     $(state_get STACK)   function: $(state_get FUNCTION)   bucket: $(state_get BUCKET)"
-        echo "orgs:      $(state_get ORGS)   region: $(state_get REGION)"
+        echo "orgs:      every org   region: $(state_get REGION)"
         if command -v aws > /dev/null 2>&1; then
             local state
             state="$(query aws cloudformation describe-stacks --stack-name "$(state_get STACK)" --region "$(state_get REGION)" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || true)"
