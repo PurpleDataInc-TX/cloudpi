@@ -75,7 +75,7 @@ install options
                                  EnableLambdaIngestion=true, which already allows the function.
   --region <region>              default: AWS_REGION, then the AWS CLI's default
   --bucket <name>                default: cloudpi-lambda-<account id>-<region> (created if missing)
-  --stack <name>                 default: cloudpi-lambda
+  --stack <name>                 default: cloudpi-lambda (at most 24 characters; the deploy role's IAM names depend on it)
   --function <name>              default: cloudpi-dlt-ingest
   --instance-role <name>         IAM role of this server: the policy CloudPi needs is attached to it
   --no-service-role              deploy with your own permissions instead of a dedicated CloudFormation role (first trial)
@@ -204,6 +204,7 @@ load_state() {
     REGION="$(state_get REGION)"; SUBNETS="$(state_get SUBNETS)"; SG="$(state_get SG)"; SECRET="$(state_get SECRET)"
     USE_ROLE="$(state_get USE_ROLE)"
     INSTANCE_ROLE="$(state_get INSTANCE_ROLE)"; DB_SG="$(state_get DB_SG)"
+    [ "${#STACK}" -le 24 ] || die "the stack name '$STACK' (saved in $STATE_FILE) is longer than the 24 characters this release's deploy role supports (its permissions name the stack's IAM roles, which CloudFormation shortens for longer stack names). Install again under a shorter --stack name"
     if [ -z "$STACK" ] || [ -z "$FUNCTION" ] || [ -z "$BUCKET" ] || [ -z "$ORGS" ] || [ -z "$REGION" ] || [ -z "$SUBNETS" ] || [ -z "$SG" ] || [ -z "$SECRET" ]; then
         die "$STATE_FILE is incomplete (an install made by an older setup-lambda.sh?): run ./setup-lambda.sh install again"
     fi
@@ -231,21 +232,30 @@ check_value() {  # check_value <flag> <value> <regex> <example>
     [[ "$2" =~ $3 ]] || die "$1 '$2' is not valid (example: $4)"
 }
 
-# The number of jobs on the function right now: a heartbeat newer than HEARTBEAT_FRESH_S whose job has no result.json yet.
+# The number of jobs on the function right now: a heartbeat newer than HEARTBEAT_FRESH_S whose job has no result.json yet. dlt-jobs/ is the
+# template's ProtocolPrefix default; this script never sets another, so the stacks it creates always use it.
+# Prints how many collections are running on the function. Fails (and prints nothing) when the job files cannot be listed: a listing that
+# failed must never read as "none running", or the guard would let an upgrade through while collections are running.
 count_running_jobs() {
-    local now key modified age prefix running=0
+    local now key modified age prefix running=0 listing answer
     now="$(date -u +%s)"
+    listing="$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "dlt-jobs/" --region "$REGION" \
+        --query "Contents[?ends_with(Key, 'heartbeat.json')].[Key,LastModified]" --output text)" || return 1
     while IFS=$'\t' read -r key modified; do
         if [ -z "$key" ] || [ "$key" = "None" ]; then continue; fi
         age=$(( now - $(date -u -d "$modified" +%s) ))
         if [ "$age" -lt "$HEARTBEAT_FRESH_S" ]; then
             prefix="${key%heartbeat.json}"
-            if ! aws s3api head-object --bucket "$BUCKET" --key "${prefix}result.json" --region "$REGION" > /dev/null 2>&1; then
-                running=$(( running + 1 ))
+            if answer="$(aws s3api head-object --bucket "$BUCKET" --key "${prefix}result.json" --region "$REGION" 2>&1)"; then
+                :                                                          # result.json is there: the job is over
+            elif [[ "$answer" == *"404"* || "$answer" == *"Not Found"* ]]; then
+                running=$(( running + 1 ))                                 # no result yet
+            else
+                echo "$answer" >&2                                         # 403, throttling, network: only a 404 means "not finished"
+                return 1
             fi
         fi
-    done < <(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "dlt-jobs/" --region "$REGION" \
-        --query "Contents[?ends_with(Key, 'heartbeat.json')].[Key,LastModified]" --output text)
+    done <<< "$listing"
     echo "$running"
 }
 
@@ -380,6 +390,11 @@ cmd_install() {
     [[ "$SECRET" =~ ^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]+:secret:.+$ ]] || die "--database-secret-arn is not a Secrets Manager ARN (example: arn:aws:secretsmanager:us-east-1:123456789012:secret:cloudpi-db-AbCd). Give the ARN of a secret that holds the database URL, never the URL itself."
     if [ -n "$DB_SG" ]; then check_value --database-security-group "$DB_SG" '^sg-[0-9a-f]+$' "sg-0123abcd"; fi
     check_value --stack "$STACK" '^[A-Za-z][A-Za-z0-9-]{0,60}$' "cloudpi-lambda"
+    # CloudFormation names IAM roles <stack>-<resource>-<random 12>, and IAM allows 64 characters. The deployer stack is <stack>-deployer and its
+    # role is <stack>-deployer-CloudFormationRole-<12>: that is the longest name, and it fits only up to 24 characters of <stack>. A longer name makes
+    # CloudFormation shorten generated role names, and the deploy role's permissions name the function stack's roles as <stack>-OperatorRole-* and
+    # <stack>-FunctionRole-*.
+    [ "${#STACK}" -le 24 ] || die "--stack '$STACK' is too long: use at most 24 characters (IAM role names are limited to 64 characters and CloudFormation shortens the ones it generates from a longer stack name)"
     check_value --function "$FUNCTION" '^[A-Za-z0-9_-]{1,64}$' "cloudpi-dlt-ingest"
 
     if $DRY_RUN; then log_info "CloudPi Lambda ingestion setup (dry run: nothing is changed)"; else log_info "CloudPi Lambda ingestion setup"; fi
@@ -458,7 +473,14 @@ cmd_upgrade() {
 
     log_step "Step 2: Checking that no collection is running on the function..."
     local running
-    running="$(count_running_jobs)"
+    if ! running="$(count_running_jobs)"; then
+        if $FORCE; then
+            log_warn "could not read the job files in s3://$BUCKET/dlt-jobs/, so a running collection would not be seen; --force: upgrading anyway"
+            running=0
+        else
+            die "could not read the job files in s3://$BUCKET/dlt-jobs/ (see the AWS message above), so I cannot tell whether a collection is running. Nothing was changed. Fix the access and run this again (--force to upgrade anyway)."
+        fi
+    fi
     if [ "$running" -gt 0 ]; then
         if $FORCE; then
             log_warn "$running collection(s) are running on the function; --force: upgrading anyway (they may fail)"
