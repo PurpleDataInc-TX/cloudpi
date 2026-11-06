@@ -57,7 +57,7 @@ usage() {
 Usage: ./setup-lambda.sh <command> [options]
 
 Commands
-  install        create the Lambda in your AWS account and switch the billing collection of every org to it
+  install        create the Lambda in your AWS account; the historical imports of every org (the months selected at onboarding) run on it
   upgrade <tag>  move the Lambda to the release <tag> (the CloudPi image tag); refuses while a collection is running on it
   follow <tag>   what cp_upgrade.sh runs after the app is healthy on <tag>: upgrade if the Lambda is installed, nothing if it is not
   local          switch collection back to this server (keeps the Lambda, switched off)
@@ -166,7 +166,7 @@ $clash"
         echo "INGEST_INVOKER=$invoker"
         echo "INGEST_LAMBDA_FUNCTION=$fn"
         echo "INGEST_LAMBDA_BUCKET=$bucket"
-        echo "INGEST_LAMBDA_ORGS=all"       # choosing the Lambda path moves every org; PiFlask sends none unless a list or "all" is set
+        echo "INGEST_LAMBDA_ORGS=all"       # every org may use the Lambda path (PiFlask sends none unless a list or "all" is set); only its historical imports go
         echo "AWS_REGION=$region"
         echo "$END_MARK"
     } >> "$tmp"
@@ -442,7 +442,7 @@ cmd_install() {
     recreate_app
 
     echo
-    log_info "Done. Billing collection of every org runs on Lambda."
+    log_info "Done. The historical imports of every org (the months selected at onboarding) now run on Lambda; scheduled collection stays on this server."
     log_info "Back to this server at any time: ./setup-lambda.sh local"
 }
 
@@ -546,7 +546,7 @@ switch_mode() {  # switch_mode <invoker> [options]
         fi
         log_info "Collection runs on this server again. The Lambda ($fn) stays in your account, switched off."
     else
-        log_info "Billing collection of every org runs on Lambda again."
+        log_info "Historical imports of every org run on Lambda again; scheduled collection stays on this server."
     fi
 }
 
@@ -557,7 +557,7 @@ cmd_status() {
     if [ -f "$STATE_FILE" ]; then
         echo "release:   $(state_get RELEASE)"
         echo "stack:     $(state_get STACK)   function: $(state_get FUNCTION)   bucket: $(state_get BUCKET)"
-        echo "orgs:      every org   region: $(state_get REGION)"
+        echo "orgs:      every org (historical imports)   region: $(state_get REGION)"
         if command -v aws > /dev/null 2>&1; then
             local state
             state="$(query aws cloudformation describe-stacks --stack-name "$(state_get STACK)" --region "$(state_get REGION)" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || true)"
