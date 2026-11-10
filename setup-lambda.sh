@@ -57,7 +57,7 @@ usage() {
 Usage: ./setup-lambda.sh <command> [options]
 
 Commands
-  install        create the Lambda in your AWS account; the historical imports of every org (the months selected at onboarding) run on it
+  install        create the Lambda in your AWS account; the imports of every org that the user marks Historical (one month at a time) run on it
   upgrade <tag>  move the Lambda to the release <tag> (the CloudPi image tag); refuses while a collection is running on it
   follow <tag>   what cp_upgrade.sh runs after the app is healthy on <tag>: upgrade if the Lambda is installed, nothing if it is not
   local          switch collection back to this server (keeps the Lambda, switched off)
@@ -442,7 +442,7 @@ cmd_install() {
     recreate_app
 
     echo
-    log_info "Done. The historical imports of every org (the months selected at onboarding) now run on Lambda; scheduled collection stays on this server."
+    log_info "Done. The imports of every org that the user marks Historical on the import page now run on Lambda, one month at a time; regular imports and scheduled collection stay on this server."
     log_info "Back to this server at any time: ./setup-lambda.sh local"
 }
 

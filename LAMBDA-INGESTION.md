@@ -1,9 +1,9 @@
 # Moving CloudPi's billing ingestion to AWS Lambda
 
 Optional. By default CloudPi collects billing data on the server it runs on. If that load is too heavy for the server, `setup-lambda.sh`
-creates a Lambda function **in your own AWS account** and runs the heavy one-off work there: the **historical imports** of your orgs (the months
-selected at onboarding or in a later historical import), one month at a time. Scheduled collection stays on this server. You can switch back with
-one command. Customers who never run it are not affected.
+creates a Lambda function **in your own AWS account** and runs the heavy one-off work there: the imports that a user marks **Historical** on the import
+page (a back-fill, one month at a time). Regular imports and scheduled collection stay on this server. You can switch back with one command.
+Customers who never run it are not affected.
 
 > `setup-lambda.sh` sits next to `cp_upgrade.sh` in this repository, and `cp_upgrade.sh` has the hook that keeps the Lambda on the same release
 > as the app. The release files themselves are **not** in git: each CloudPi release has a GitHub Release of this repository, named by the image
@@ -68,8 +68,9 @@ cd cloudpi
 ```
 
 There is no list of orgs to give: every org may use the Lambda (the script writes `INGEST_LAMBDA_ORGS=all` into the `.env` block). Only **historical
-imports** go to it: the months a user selects at onboarding or in a later historical import, one month at a time, oldest first. Scheduled collection,
-and every month that is already collected, keeps running on this server. If a long import cannot finish within one collection's time, the months
+imports** go to it: the import page offers **Regular** (any months, as before) or **Historical** (a back-fill, one month at a time), and the
+files a user imports as Historical run on the Lambda, one month at a time, oldest first. Regular imports, scheduled collection,
+and every month that is already collected keep running on this server. If a long import cannot finish within one collection's time, the months
 that did not start stay pending and the next collection continues them. To send everything back to this server, run `./setup-lambda.sh local`.
 
 It does, in order: checks the release files and your AWS identity, verifies the bundle's SHA-256, creates a private encrypted bucket (job files
