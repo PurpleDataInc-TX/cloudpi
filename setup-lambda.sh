@@ -43,6 +43,7 @@ trap '[ -z "$WORKDIR" ] || rm -rf "$WORKDIR"' EXIT
 # The settings of one install. They are script-level so that install, upgrade and follow run the same steps below.
 SUBNETS="" SG="" SECRET="" REGION="${AWS_REGION:-}" BUCKET="" STACK="cloudpi-lambda" FUNCTION="cloudpi-dlt-ingest"
 INSTANCE_ROLE="" USE_ROLE=true DB_SG="" RELEASE=""
+CH_SECRET="" REDIS_SECRET="" READ_SOURCE="" NO_CH=false      # optional: the function also writes ClickHouse (needs both secrets)
 ACCOUNT="" BUNDLE_SHA="" BUNDLE_PATH="" ROLE_ARGS=()
 
 # Reads change nothing and always run. Anything that changes AWS or this server goes through `mutate`, which a dry run only prints.
@@ -69,6 +70,12 @@ install options
   --subnets <a,b>                REQUIRED. Two subnets in different Availability Zones, e.g. subnet-0a1,subnet-0b2
   --security-group <sg-id>       REQUIRED. No inbound rules; outbound to S3, Secrets Manager and your database
   --database-secret-arn <arn>    REQUIRED. Secrets Manager secret whose value is the MySQL URL the function connects with
+  --clickhouse-secret-arn <arn>  OPTIONAL. Secrets Manager secret (JSON: host, port, user, password, database, secure, ca_cert) of the ClickHouse the
+                                 function also writes. Needs --redis-secret-arn. Without it the function uses MySQL only, as before.
+  --redis-secret-arn <arn>       OPTIONAL. Secrets Manager secret (JSON: host, port, password) of the Redis that numbers the rows both databases hold
+  --read-source <mysql|compare|clickhouse>  where the function reads from when ClickHouse is on (default clickhouse)
+  --no-clickhouse                remove ClickHouse from the function. Without it, an install that gives no ClickHouse flags keeps the ClickHouse
+                                 settings of the last install
   --database-security-group <sg> the security group of your database (RDS, or any MySQL host in the same VPC): port 3306 is opened on it to the
                                  function's group. Not needed for the CloudPi server created by cloud-template.yaml with
                                  EnableLambdaIngestion=true, which already allows the function.
@@ -197,6 +204,8 @@ save_state() {
     printf '%s\n' "STACK=$STACK" "FUNCTION=$FUNCTION" "BUCKET=$BUCKET" "REGION=$REGION" "RELEASE=${RELEASE:-unknown}" \
         "BUNDLE_SHA256=$BUNDLE_SHA" "TEMPLATES_SHA256=$(templates_sha)" "SUBNETS=$SUBNETS" "SG=$SG" "SECRET=$SECRET" \
         "USE_ROLE=$USE_ROLE" "INSTANCE_ROLE=$INSTANCE_ROLE" "DB_SG=$DB_SG" > "$tmp"
+    if [ -n "$CH_SECRET" ]; then printf '%s\n' "CH_SECRET=$CH_SECRET" "REDIS_SECRET=$REDIS_SECRET" >> "$tmp"; fi
+    if [ -n "$READ_SOURCE" ]; then printf '%s\n' "READ_SOURCE=$READ_SOURCE" >> "$tmp"; fi
     cat "$tmp" > "$STATE_FILE"
     rm -f "$tmp"
 }
@@ -209,6 +218,7 @@ load_state() {
     REGION="$(state_get REGION)"; SUBNETS="$(state_get SUBNETS)"; SG="$(state_get SG)"; SECRET="$(state_get SECRET)"
     USE_ROLE="$(state_get USE_ROLE)"
     INSTANCE_ROLE="$(state_get INSTANCE_ROLE)"; DB_SG="$(state_get DB_SG)"
+    CH_SECRET="$(state_get CH_SECRET)"; REDIS_SECRET="$(state_get REDIS_SECRET)"; READ_SOURCE="$(state_get READ_SOURCE)"
     [ "${#STACK}" -le 24 ] || die "the stack name '$STACK' (saved in $STATE_FILE) is longer than the 24 characters this release's deploy role supports (its permissions name the stack's IAM roles, which CloudFormation shortens for longer stack names). Install again under a shorter --stack name"
     if [ -z "$STACK" ] || [ -z "$FUNCTION" ] || [ -z "$BUCKET" ] || [ -z "$REGION" ] || [ -z "$SUBNETS" ] || [ -z "$SG" ] || [ -z "$SECRET" ]; then
         die "$STATE_FILE is incomplete (an install made by an older setup-lambda.sh?): run ./setup-lambda.sh install again"
@@ -352,10 +362,13 @@ deploy_role_stack() {   # sets ROLE_ARGS
 
 deploy_function_stack() {
     local key="dlt/bundle-$BUNDLE_SHA.zip"
+    local extra=()
+    if [ -n "$CH_SECRET" ]; then extra+=("ClickHouseSecretArn=$CH_SECRET" "RedisSecretArn=$REDIS_SECRET"); fi
+    if [ -n "$READ_SOURCE" ]; then extra+=("DatabaseReadSource=$READ_SOURCE"); fi
     mutate aws cloudformation deploy --template-file "$LAMBDA_DIR/template.yaml" --stack-name "$STACK" --region "$REGION" \
         --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset ${ROLE_ARGS[@]+"${ROLE_ARGS[@]}"} --tags project=cloudpi-lambda \
         --parameter-overrides "FunctionName=$FUNCTION" "ArtifactBucket=$BUCKET" "BundleKey=$key" "BundleSha256=$BUNDLE_SHA" \
-        "SubnetIds=$SUBNETS" "SecurityGroupId=$SG" "DatabaseSecretArn=$SECRET" \
+        "SubnetIds=$SUBNETS" "SecurityGroupId=$SG" "DatabaseSecretArn=$SECRET" ${extra[@]+"${extra[@]}"} \
         "ProjectTag=cloudpi-lambda"
 }
 
@@ -373,6 +386,10 @@ cmd_install() {
             --subnets) SUBNETS="${2:-}"; shift 2;;
             --security-group) SG="${2:-}"; shift 2;;
             --database-secret-arn) SECRET="${2:-}"; shift 2;;
+            --clickhouse-secret-arn) CH_SECRET="${2:-}"; shift 2;;
+            --redis-secret-arn) REDIS_SECRET="${2:-}"; shift 2;;
+            --read-source) READ_SOURCE="${2:-}"; shift 2;;
+            --no-clickhouse) NO_CH=true; shift;;
             --database-security-group) DB_SG="${2:-}"; shift 2;;
             --region) REGION="${2:-}"; shift 2;;
             --bucket) BUCKET="${2:-}"; shift 2;;
@@ -391,6 +408,26 @@ cmd_install() {
     # Never print this value back: a customer may have pasted the MySQL URL, with its password, where the secret's ARN belongs.
     [ -n "$SECRET" ] || die "--database-secret-arn is required"
     [[ "$SECRET" =~ ^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]+:secret:.+$ ]] || die "--database-secret-arn is not a Secrets Manager ARN (example: arn:aws:secretsmanager:us-east-1:123456789012:secret:cloudpi-db-AbCd). Give the ARN of a secret that holds the database URL, never the URL itself."
+    # ClickHouse is kept across installs: running install again to change something else must not silently turn dual write off.
+    if $NO_CH; then
+        if [ -n "$CH_SECRET$REDIS_SECRET$READ_SOURCE" ]; then die "--no-clickhouse cannot be combined with --clickhouse-secret-arn, --redis-secret-arn or --read-source"; fi
+    elif [ -z "$CH_SECRET" ] && [ -z "$REDIS_SECRET" ] && [ -n "$(state_get CH_SECRET)" ]; then
+        CH_SECRET="$(state_get CH_SECRET)"; REDIS_SECRET="$(state_get REDIS_SECRET)"
+        [ -n "$READ_SOURCE" ] || READ_SOURCE="$(state_get READ_SOURCE)"
+        log_info "keeping the ClickHouse and Redis settings of the last install (--no-clickhouse removes them)"
+    fi
+    # The optional ClickHouse / Redis secrets: ARNs only (never echo a value back), and ClickHouse needs the Redis that numbers its rows.
+    local pair flag value
+    for pair in "--clickhouse-secret-arn=$CH_SECRET" "--redis-secret-arn=$REDIS_SECRET"; do
+        flag="${pair%%=*}"; value="${pair#*=}"
+        if [ -n "$value" ] && ! [[ "$value" =~ ^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]+:secret:.+$ ]]; then die "$flag is not a Secrets Manager ARN"; fi
+    done
+    if [ -n "$CH_SECRET" ] && [ -z "$REDIS_SECRET" ]; then die "--clickhouse-secret-arn needs --redis-secret-arn (the Redis that numbers the rows both databases hold)"; fi
+    if [ -n "$REDIS_SECRET" ] && [ -z "$CH_SECRET" ]; then die "--redis-secret-arn is used only with --clickhouse-secret-arn"; fi
+    if [ -n "$READ_SOURCE" ]; then
+        [ -n "$CH_SECRET" ] || die "--read-source is used only with --clickhouse-secret-arn"
+        case "$READ_SOURCE" in mysql|compare|clickhouse) ;; *) die "--read-source must be mysql, compare or clickhouse";; esac
+    fi
     if [ -n "$DB_SG" ]; then check_value --database-security-group "$DB_SG" '^sg-[0-9a-f]+$' "sg-0123abcd"; fi
     check_value --stack "$STACK" '^[A-Za-z][A-Za-z0-9-]{0,60}$' "cloudpi-lambda"
     # CloudFormation names IAM roles <stack>-<resource>-<random 12>, and IAM allows 64 characters. The deployer stack is <stack>-deployer and its
@@ -558,6 +595,7 @@ cmd_status() {
         echo "release:   $(state_get RELEASE)"
         echo "stack:     $(state_get STACK)   function: $(state_get FUNCTION)   bucket: $(state_get BUCKET)"
         echo "orgs:      every org (historical imports)   region: $(state_get REGION)"
+        if [ -n "$(state_get CH_SECRET)" ]; then echo "clickhouse: yes (the function writes MySQL and ClickHouse; reads: $(state_get READ_SOURCE | grep . || echo clickhouse))"; else echo "clickhouse: no (the function uses MySQL only)"; fi
         if command -v aws > /dev/null 2>&1; then
             local state
             state="$(query aws cloudformation describe-stacks --stack-name "$(state_get STACK)" --region "$(state_get REGION)" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || true)"
