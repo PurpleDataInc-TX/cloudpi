@@ -21,6 +21,8 @@ Customers who never run it are not affected.
    Give the script the secret's **ARN**, never the URL.
 5. Docker with the Compose plugin (already needed to run CloudPi), `curl`, and internet access to github.com: `--release <tag>` downloads the
    release files into `./lambda` and refuses the bundle unless its SHA-256 matches the manifest.
+6. Only if your CloudPi also writes to ClickHouse (`DB_DUAL_WRITE`, on by default): two more secrets, one for ClickHouse and one for Redis. See
+   **ClickHouse and Redis** below. Without them the function writes MySQL only.
 
 ## Your server and your database
 
@@ -83,10 +85,42 @@ deploys the function (stack `cloudpi-lambda`), switches the function off so no m
 If you did not pass `--instance-role`, attach the policy named `AppPolicyArn` in the `cloudpi-lambda-deployer` stack outputs to the AWS role of
 this server. Without it CloudPi cannot invoke the function.
 
+## ClickHouse and Redis (optional)
+
+When CloudPi writes every change to ClickHouse as well as MySQL (`DB_DUAL_WRITE`, on by default), the function has to write both too, or the
+months it loads would be missing in ClickHouse. Give `install` two more secrets (ARNs, never the values):
+
+```
+./setup-lambda.sh install ... \
+    --clickhouse-secret-arn arn:aws:secretsmanager:us-east-1:111122223333:secret:cloudpi-clickhouse-AbCd \
+    --redis-secret-arn arn:aws:secretsmanager:us-east-1:111122223333:secret:cloudpi-redis-AbCd \
+    --read-source clickhouse         # optional: mysql | compare | clickhouse
+```
+
+- **The ClickHouse secret** is JSON: `{"host": "...", "port": 8443, "user": "...", "password": "...", "database": "...", "secure": true, "ca_cert": "..."}`.
+  `ca_cert` is the **text** of the CA certificate (PEM), needed only when the server's certificate is not signed by a public CA. The function
+  writes it to a file itself.
+- **The Redis secret** is JSON: `{"host": "...", "port": 6379, "password": "..."}` (`username` is optional). It must be the Redis CloudPi itself
+  uses: it numbers the rows that both databases hold. ClickHouse without Redis is refused.
+- **`--read-source`** is where the function reads from: `clickhouse` (the default, as in the app), `compare` (serve MySQL and read ClickHouse beside
+  it, logging a mismatch) or `mysql` (read MySQL; it still writes both). It is only valid together with the ClickHouse secret.
+- **Network.** The function's security group must be allowed on the ClickHouse and Redis ports. The installer opens port 3306 for the database
+  (`--database-security-group`) and nothing for ClickHouse or Redis: allow the function's group on them yourself.
+- **The ClickHouse user** needs the access CloudPi's own user has: the function creates and drops its own stage tables, inserts, and deletes the
+  rows of the months it replaces.
+- **Certificates.** The function runs Python 3.13, which refuses a CA certificate without the key usage extension. If the connection fails with
+  `CA cert does not include key usage extension`, issue the CA with `keyUsage = keyCertSign, cRLSign`.
+- **Leaving the secrets out** is allowed, and the function then writes MySQL only (dual write off, reads from MySQL). Do not do that when your
+  CloudPi reads from ClickHouse: the months the function loads would be missing there.
+
+Running `install` again without these flags **keeps** the ClickHouse and Redis settings of the last install (and `--read-source` can be changed on
+its own). To take ClickHouse out of the function on purpose, run `./setup-lambda.sh install ... --no-clickhouse`. `status` says whether ClickHouse is
+on and where the function reads from; `upgrade` and `follow` keep the settings.
+
 ## Day to day
 
 ```
-./setup-lambda.sh status    # mode, orgs, stack state
+./setup-lambda.sh status    # mode, orgs, stack state, whether ClickHouse is on
 ./setup-lambda.sh local     # collect on this server again; the Lambda stays in your account, switched off
 ./setup-lambda.sh lambda    # collect on Lambda again, for the same orgs
 ```
@@ -107,8 +141,8 @@ mismatch fails the month with a message that says to deploy the matching functio
 
 `upgrade` downloads and verifies the release, **refuses while a collection is running on the function** (a job with a recent heartbeat and no result
 yet; `--force` overrides), uploads the bundle, redeploys the same stack with the same settings, and switches the function off again. It does not
-touch `.env` or restart the app. Between the app becoming healthy and the Lambda finishing, a collection on Lambda can fail with a schema message
-and is retried.
+touch `.env` or restart the app. It keeps the ClickHouse and Redis settings of the install. Between the app becoming healthy and the Lambda
+finishing, a collection on Lambda can fail with a schema message and is retried.
 
 ## What is not covered yet
 
