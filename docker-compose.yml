@@ -4,7 +4,7 @@ secrets:
 
 services:
   db:
-    image: cloudpi1/cloudpi:latest-db
+    image: cloudpi1/cloudpi:Cloudpi_db_v1.1.074
     container_name: cloudpi-db
     volumes:
       - mysql_data:/var/lib/mysql
@@ -41,13 +41,58 @@ services:
           cpus: '4'
           memory: 6G
 
+  clickhouse:
+    # The analytics database. Its image comes from the same build as the db image: Cloudpi_db_<x> -> Cloudpi_ch_<x>.
+    # cp_upgrade.sh moves CH_IMAGE_TAG with every upgrade; an install without this service gets it from
+    # clickhouse-setup.sh (see README-CLICKHOUSE.md).
+    image: cloudpi1/cloudpi:${CH_IMAGE_TAG:-Cloudpi_ch_v1.1.074}
+    container_name: cloudpi-clickhouse
+    restart: always
+    networks:
+      - cloudpi-network
+    secrets:
+      - cloudpi_secrets
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+      - clickhouse_tls:/etc/clickhouse-tls
+      - clickhouse_ca:/etc/clickhouse-ca
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    # ClickHouse sizes its memory, threads and caches from these limits at every start.
+    deploy:
+      resources:
+        limits:
+          cpus: '${CH_CPUS:-2}'
+          memory: ${CH_MEMORY:-4G}
+
   app:
-    image: cloudpi1/cloudpi:latest-app
+    image: cloudpi1/cloudpi:Cloudpi_v1.1.074
     container_name: cloudpi-app
     hostname: cloudpi-app
     restart: always
     depends_on:
       db:
+        condition: service_healthy
+      clickhouse:
         condition: service_healthy
     secrets:
       - cloudpi_secrets
@@ -60,6 +105,9 @@ services:
     ports:
       - "443:443" # HTTPS
       - "80:80" # HTTP
+      # Redis stays on this host unless .env sets REDIS_PUBLISH_IP, which only the optional Pico add-on needs
+      # (README-PICO.md).
+      - "${REDIS_PUBLISH_IP:-127.0.0.1}:6379:6379"
     networks:
       - cloudpi-network
     env_file:
@@ -78,10 +126,21 @@ services:
       # (tracker/2026-07-09/databricks-ssl-frozen-openssl-trust-store)
       SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
       SSL_CERT_DIR: /etc/ssl/certs
+      # Where saves and reads go: both databases, with ClickHouse answering reads, unless .env says otherwise.
+      # DB_WRITE=mysql and DB_READ=mysql run the app on MySQL alone, as before ClickHouse (README-CLICKHOUSE.md).
+      DB_WRITE: ${DB_WRITE:-dual}
+      DB_READ: ${DB_READ:-clickhouse}
+      CH_HOST: cloudpi-clickhouse
+      CH_PORT: "8443"
+      CH_SECURE: "true"
+      # The private CA the clickhouse container creates; only the app's ClickHouse clients trust it.
+      # CH_USER and CH_PASSWORD come from cloudpi.secrets.
+      CH_CA_CERT: /etc/clickhouse-ca/ca.crt
     volumes:
       - redis_data:/var/lib/redis
       - ./certs:/home/certs
       - cloudpi:/app/backups
+      - clickhouse_ca:/etc/clickhouse-ca:ro
       # Expose the JSON log dir to the host so the pre-installed rsyslog can tail it.
       # MUST be an absolute /var/log path: rsyslog's AppArmor profile only allows
       # reads under /var/log/** (NOT /root or /home), so a relative ./logs/pico
@@ -104,6 +163,14 @@ volumes:
   redis_data:
     driver: local
   cloudpi:
+    driver: local
+  clickhouse_data:
+    driver: local
+  clickhouse_logs:
+    driver: local
+  clickhouse_tls:
+    driver: local
+  clickhouse_ca:
     driver: local
 
 networks:

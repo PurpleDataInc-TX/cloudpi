@@ -1,0 +1,51 @@
+# Runs the Pico analyst on its own VM. Setup and first run: README-PICO.md.
+# Only one copy may run: a file lock in the data folder stops a second one.
+version: "3.8"
+
+secrets:
+  # Pico's settings and secrets, KEY=VALUE per line (pico/pico.secrets.example). PICO_SECRETS_FILE points it elsewhere,
+  # such as the file a secret manager writes to /tmp.
+  pico_secrets:
+    file: ${PICO_SECRETS_FILE:-./pico.secrets}
+
+services:
+  pico:
+    image: cloudpi1/cloudpi:${PICO_IMAGE_TAG:-Cloudpi_pico_v1.1.074}
+    pull_policy: always
+    container_name: cloudpi-pico
+    restart: always
+    # Never point pico_secrets at CloudPi's cloudpi.secrets: Pico refuses to start when it sees platform secrets.
+    environment:
+      PICO_ENV: production
+    secrets:
+      - pico_secrets
+    volumes:
+      # agent.yml and analyst.yml ship in the image and take their values from pico.secrets. To use your own (several
+      # Slack apps, or tuned settings), mount it read-only:
+      #   - ./agent.yml:/etc/pico/agent.yml:ro
+      #   - ./analyst.yml:/etc/pico/analyst.yml:ro
+      # What Pico has seen and posted. Back it up: an empty folder makes every workspace new, so nothing is posted.
+      - pico_data:/home/pico/.pico/data
+    # On SIGTERM Pico gives each of its three jobs up to 60 s to finish.
+    stop_grace_period: 190s
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: '${PICO_CPUS:-2}'
+          memory: ${PICO_MEMORY:-2G}
+
+volumes:
+  pico_data:
+    driver: local

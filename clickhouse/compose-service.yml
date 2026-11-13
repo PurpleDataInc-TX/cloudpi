@@ -1,0 +1,42 @@
+  clickhouse:
+    # The analytics database. Its image comes from the same build as the db image: Cloudpi_db_<x> -> Cloudpi_ch_<x>.
+    # cp_upgrade.sh moves CH_IMAGE_TAG with every upgrade; an install without this service gets it from
+    # clickhouse-setup.sh (see README-CLICKHOUSE.md).
+    image: cloudpi1/cloudpi:${CH_IMAGE_TAG:-Cloudpi_ch_v1.1.074}
+    container_name: cloudpi-clickhouse
+    restart: always
+    networks:
+      - cloudpi-network
+    secrets:
+      - cloudpi_secrets
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+      - clickhouse_tls:/etc/clickhouse-tls
+      - clickhouse_ca:/etc/clickhouse-ca
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    # ClickHouse sizes its memory, threads and caches from these limits at every start.
+    deploy:
+      resources:
+        limits:
+          cpus: '${CH_CPUS:-2}'
+          memory: ${CH_MEMORY:-4G}
