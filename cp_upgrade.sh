@@ -203,6 +203,8 @@ LOCKOUT_FILE_PATH="/app/backups/.migration_lockout"
 
 APP_CONTAINER="cloudpi-app"
 DB_CONTAINER="cloudpi-db"
+CH_CONTAINER="cloudpi-clickhouse"
+CH_STATE_FILE="${SCRIPT_DIR}/.deploy_state_clickhouse"
 DOCKER_REPOSITORY="cloudpi1/cloudpi"
 # Backup directory — resolution priority:
 #   1. --backup-dir <path>  CLI flag (highest, set by early arg parser below)
@@ -511,7 +513,7 @@ detect_fs_sudo() {
     # Strategy 2: Find the named volume directly (container may not exist yet on --init)
     if [ -z "$probe_path" ]; then
         local db_vol_name
-        db_vol_name=$(run_docker volume ls -q --filter "name=mysql_data" 2>/dev/null | grep -E "mysql_data$" | head -1)
+        db_vol_name=$(run_docker volume ls -q --filter "name=mysql_data" 2>/dev/null | grep -E "mysql_data$" | head -1 || true)
         if [ -n "$db_vol_name" ]; then
             probe_path=$(run_docker volume inspect -f '{{.Mountpoint}}' "$db_vol_name" 2>/dev/null || echo "")
         fi
@@ -1321,7 +1323,7 @@ validate_backup_path() {
     # Strict filename pattern — non-negotiable (prevents path traversal / arbitrary paths)
     local base
     base=$(basename "$resolved")
-    if ! [[ "$base" =~ ^(db|redis|cloudpi)_volume_[0-9]{8}_[0-9]{6}\.tar(\.enc)?$ ]]; then
+    if ! [[ "$base" =~ ^(db|redis|cloudpi|clickhouse)_volume_[0-9]{8}_[0-9]{6}\.tar(\.enc)?$ ]]; then
         return 1
     fi
 
@@ -1391,12 +1393,8 @@ check_prerequisites() {
     fi
 
     # Secrets file — resolve path from docker compose config (handles env vars, anchors, etc.)
-    local secrets_path=""
-    if [ -f "$COMPOSE_FILE" ]; then
-        # docker compose config outputs fully resolved YAML with absolute paths
-        secrets_path=$(run_compose -f "$COMPOSE_FILE" config 2>/dev/null \
-            | sed -n '/^secrets:/,/^[a-z]/{ /file:/{ s/.*file: *//; s/ *$//; p; q; } }' || echo "")
-    fi
+    local secrets_path
+    secrets_path=$(secrets_file_path)
     if [ -n "$secrets_path" ]; then
         if [ ! -f "$secrets_path" ]; then
             log_warn "Secrets file not found: $secrets_path (resolved from $COMPOSE_FILE)"
@@ -2030,6 +2028,123 @@ backup_redis_volume()   { backup_volume "Redis"   "redis_data" "$APP_CONTAINER" 
 restore_redis_volume()  { restore_volume "Redis"   "redis_data" "$APP_CONTAINER" "/var/lib/redis"  "$1"; }
 backup_app_volume()     { backup_volume "App"     "cloudpi$"   "$APP_CONTAINER" "/app/backups"    "$1"; }
 restore_app_volume()    { restore_volume "App"     "cloudpi$"   "$APP_CONTAINER" "/app/backups"    "$1"; }
+backup_ch_volume()      { backup_volume "ClickHouse" "clickhouse_data" "$CH_CONTAINER" "/var/lib/clickhouse" "$1"; }
+restore_ch_volume()     { restore_volume "ClickHouse" "clickhouse_data" "$CH_CONTAINER" "/var/lib/clickhouse" "$1"; }
+
+# ============================================================
+# ClickHouse
+# ============================================================
+# The clickhouse image comes from the same build as the app: Cloudpi_v<x> -> Cloudpi_ch_v<x>.
+# Its tag lives in .env as CH_IMAGE_TAG; the compose file reads it from there.
+
+# The secrets file the containers get, resolved by docker compose (handles env vars, anchors, etc.).
+secrets_file_path() {
+    [ -f "$COMPOSE_FILE" ] || return 0
+    run_compose -f "$COMPOSE_FILE" config 2>/dev/null \
+        | sed -n '/^secrets:/,/^[a-z]/{ /file:/{ s/.*file: *//; s/ *$//; p; q; } }' || true
+}
+
+# Checks the ClickHouse user can be stored. A Key Vault install rewrites /run/secrets-tmp at every boot, so
+# CH_USER and CH_PASSWORD must already be in the vault; a local secrets file gets them from clickhouse-setup.sh.
+check_ch_secrets() {
+    local secrets_path=$1
+    if [ -z "$secrets_path" ] || ! run_maybe_sudo test -f "$secrets_path"; then
+        log_error "Secrets file not found: ${secrets_path:-<unresolved from $COMPOSE_FILE>}"
+        return 1
+    fi
+    case "$secrets_path" in
+        /run/*) ;;
+        *) return 0 ;;
+    esac
+    if run_maybe_sudo grep -q '^CH_USER=' "$secrets_path" && run_maybe_sudo grep -q '^CH_PASSWORD=' "$secrets_path"; then
+        return 0
+    fi
+    log_error "ClickHouse needs CH_USER and CH_PASSWORD in your secrets, and $secrets_path is rebuilt from Key Vault at every boot"
+    log_error "Add them to the Key Vault secret, fetch it again, then re-run this command:"
+    log_error "  1. Download:  az keyvault secret show --vault-name <vault> --name cloudpi-secrets --query value -o tsv > cloudpi.secrets"
+    log_error "  2. Append:    CH_USER=cloudpi_app   and   CH_PASSWORD=<openssl rand -hex 16>"
+    log_error "  3. Upload:    az keyvault secret set --vault-name <vault> --name cloudpi-secrets --file cloudpi.secrets && rm cloudpi.secrets"
+    log_error "  4. Fetch:     sudo systemctl restart cloudpi-fetch-secrets"
+    return 1
+}
+
+has_clickhouse_service() {
+    sed -n '/^services:/,/^[a-z]/p' "$COMPOSE_FILE" 2>/dev/null | grep -q '^  clickhouse:'
+}
+
+ch_tag_for() {
+    local app_tag=$1
+    echo "Cloudpi_ch_${app_tag#Cloudpi_}"
+}
+
+get_ch_tag() {
+    [ -f "$ENV_FILE" ] || return 0
+    grep -m1 '^CH_IMAGE_TAG=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d ' "'"'"'' || true
+}
+
+set_ch_tag() {
+    local new_tag=$1
+    if [ ! -w "$ENV_FILE" ]; then
+        log_error "Cannot write to $ENV_FILE — check file permissions"
+        return 1
+    fi
+    if grep -q '^CH_IMAGE_TAG=' "$ENV_FILE"; then
+        sed -i "s|^CH_IMAGE_TAG=.*|CH_IMAGE_TAG=${new_tag}|" "$ENV_FILE"
+    else
+        printf '\nCH_IMAGE_TAG=%s\n' "$new_tag" >> "$ENV_FILE"
+    fi
+    if [ "$(get_ch_tag)" != "$new_tag" ]; then
+        log_error "ClickHouse image tag update failed: expected '$new_tag' in $ENV_FILE"
+        return 1
+    fi
+}
+
+# Records what a rollback needs to put ClickHouse back: its previous tag and its data backup.
+save_ch_state() {
+    local rollback_ch_tag=$1
+    local backup_ch=$2
+    {
+        echo "rollback_ch_tag=${rollback_ch_tag}"
+        echo "backup_ch=${backup_ch}"
+        echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "${CH_STATE_FILE}.tmp" && mv "${CH_STATE_FILE}.tmp" "$CH_STATE_FILE"
+}
+
+read_ch_state_field() {
+    [ -f "$CH_STATE_FILE" ] || return 0
+    grep -m1 "^$1=" "$CH_STATE_FILE" 2>/dev/null | cut -d= -f2- || true
+}
+
+stop_clickhouse() {
+    log_info "Stopping ClickHouse container..."
+    run_compose -f "$COMPOSE_FILE" stop -t 120 clickhouse 2>&1 || true
+    sleep 2
+    if [ "$(run_docker inspect -f '{{.State.Running}}' "$CH_CONTAINER" 2>/dev/null || echo false)" = "true" ]; then
+        log_error "ClickHouse container did not stop"
+        return 1
+    fi
+}
+
+start_clickhouse() {
+    log_info "Starting ClickHouse container..."
+    if ! run_compose -f "$COMPOSE_FILE" up -d --no-deps clickhouse; then
+        log_error "Failed to start the ClickHouse container"
+        return 1
+    fi
+    local waited=0 health=""
+    while [ "$waited" -lt 180 ]; do
+        health=$(run_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$CH_CONTAINER" 2>/dev/null || echo "")
+        if [ "$health" = "healthy" ]; then
+            log_ok "ClickHouse is healthy"
+            return 0
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+    log_error "ClickHouse did not become healthy within 180s (last status: ${health:-unknown})"
+    log_error "  → Logs: docker logs $CH_CONTAINER"
+    return 1
+}
 
 backup_current_state() {
     # Take a snapshot of the current state (DB + Redis + App volumes).
@@ -2752,6 +2867,49 @@ do_deploy() {
         exit 1
     fi
 
+    # --- Step 2.6: ClickHouse image from the same build; add the service on the first ClickHouse upgrade ---
+    local new_ch_tag current_ch_tag ch_in_use=false ch_was_present=false
+    new_ch_tag=$(ch_tag_for "$new_tag")
+    current_ch_tag=$(get_ch_tag)
+    has_clickhouse_service && ch_was_present=true
+    local ch_image="${DOCKER_REPOSITORY}:${new_ch_tag}"
+    log_info "Pre-pulling ClickHouse image ${new_ch_tag}..."
+    if pull_output=$(run_docker pull "$ch_image" 2>&1) || run_docker image inspect "$ch_image" >/dev/null 2>&1; then
+        ch_in_use=true
+        log_ok "ClickHouse image ready"
+    elif [ "$ch_was_present" = true ]; then
+        log_error "Failed to pull $ch_image — this deployment runs ClickHouse and needs the image from the same build"
+        diagnose_pull_failure "$ch_image" "$pull_output"
+        log_error "No changes made — containers are still running"
+        clear_deploy_phase
+        exit 1
+    else
+        log_info "Build ${new_tag} has no ClickHouse image — deploying without ClickHouse"
+    fi
+
+    if [ "$ch_in_use" = true ] && [ "$ch_was_present" = false ]; then
+        if [ "$(basename "$COMPOSE_FILE")" != "docker-compose.yml" ] || [ ! -x "${SCRIPT_DIR}/clickhouse-setup.sh" ]; then
+            log_error "ClickHouse must be added to this deployment, but clickhouse-setup.sh or docker-compose.yml is missing beside $0"
+            log_error "Copy clickhouse-setup.sh and clickhouse/compose-service.yml from the install kit, then re-run"
+            log_error "No changes made — containers are still running"
+            clear_deploy_phase
+            exit 1
+        fi
+        local ch_secrets
+        ch_secrets=$(secrets_file_path)
+        if ! check_ch_secrets "$ch_secrets"; then
+            log_error "No changes made — containers are still running"
+            clear_deploy_phase
+            exit 1
+        fi
+        log_info "Adding the ClickHouse service to the deployment (the app stays on MySQL: DB_WRITE=mysql, DB_READ=mysql)..."
+        if ! "${SCRIPT_DIR}/clickhouse-setup.sh" --ch-tag "$new_ch_tag" --dir "$(dirname "$COMPOSE_FILE")" --secrets "$ch_secrets"; then
+            log_error "clickhouse-setup.sh failed — its file changes were restored; no containers were touched"
+            clear_deploy_phase
+            exit 1
+        fi
+    fi
+
     # --- Step 3: Stop app container ---
     save_deploy_phase "stopping" "$new_tag" "$current_tag"
     if ! stop_and_remove_app; then
@@ -2803,6 +2961,26 @@ do_deploy() {
         CURRENT_APP_BACKUP=""
     fi
 
+    # ClickHouse holds data once the app writes to it, so its backup is as mandatory as MySQL's.
+    CURRENT_CH_BACKUP=""
+    if [ "$ch_was_present" = true ]; then
+        CURRENT_CH_BACKUP=$(maybe_enc_suffix "${BACKUP_DIR}/clickhouse_volume_${backup_ts}.tar")
+        if ! stop_clickhouse || ! backup_ch_volume "$CURRENT_CH_BACKUP"; then
+            log_error "ClickHouse backup failed — aborting deployment"
+            log_info "Restarting containers..."
+            start_clickhouse || log_warn "Failed to restart ClickHouse"
+            run_compose -f "$COMPOSE_FILE" up -d db || log_warn "Failed to restart DB"
+            wait_for_db || true
+            run_compose_app_up || log_warn "Failed to restart app"
+            exit 1
+        fi
+    fi
+    if [ "$ch_in_use" = true ]; then
+        save_ch_state "$current_ch_tag" "$CURRENT_CH_BACKUP"
+    else
+        rm -f "$CH_STATE_FILE"
+    fi
+
     save_state "$current_tag" "rollback_target" "$current_tag" "$CURRENT_BACKUP" "$CURRENT_REDIS_BACKUP" "$CURRENT_APP_BACKUP" "$CURRENT_BACKUP_CHECKSUM" "$current_db_tag" "$current_db_tag"
     # Create deployment snapshot (for multi-level rollback via --history/--restore)
     if ! create_snapshot "$CURRENT_BACKUP" "$CURRENT_REDIS_BACKUP" "$CURRENT_APP_BACKUP" "deploy"; then
@@ -2833,6 +3011,18 @@ do_deploy() {
         log_error "Failed to update image tag in $COMPOSE_FILE"
         do_rollback_internal "$current_tag" "Failed to update image tag"
         return 1
+    fi
+
+    if [ "$ch_in_use" = true ]; then
+        log_info "Setting ClickHouse image tag to: $new_ch_tag"
+        if ! set_ch_tag "$new_ch_tag"; then
+            do_rollback_internal "$current_tag" "Failed to update ClickHouse image tag"
+            return 1
+        fi
+        if ! start_clickhouse; then
+            do_rollback_internal "$current_tag" "ClickHouse failed to start"
+            return 1
+        fi
     fi
 
     # (Image was pre-pulled in step 2.5 — already cached locally)
@@ -2901,6 +3091,7 @@ do_deploy() {
     log_ok "DEPLOYMENT COMPLETE"
     echo "=========================================="
     echo "  Image:   ${DOCKER_REPOSITORY}:${new_tag}"
+    [ "$ch_in_use" = true ] && echo "  ClickHouse: ${DOCKER_REPOSITORY}:${new_ch_tag}"
     echo "  Status:  healthy"
     echo "  Rollback available: ${current_tag:-none}"
     echo "=========================================="
@@ -3195,6 +3386,38 @@ do_rollback_internal() {
                 log_warn "Failed to revert DB image tag — continuing with current DB image"
                 log_warn "Manual fix: edit $COMPOSE_FILE and set the DB image tag to $rollback_db_tag"
             fi
+        fi
+    fi
+
+    # Put ClickHouse back where the deploy found it: its data and its image tag.
+    local rollback_ch_tag ch_backup_path
+    rollback_ch_tag=$(read_ch_state_field "rollback_ch_tag")
+    ch_backup_path=$(read_ch_state_field "backup_ch")
+    if has_clickhouse_service && { [ -n "$rollback_ch_tag" ] || [ -n "$ch_backup_path" ]; }; then
+        if ! stop_clickhouse; then
+            _save_rollback_failed
+            return 1
+        fi
+        if [ -n "$ch_backup_path" ]; then
+            if ! validate_backup_path "$ch_backup_path" || [ ! -f "$ch_backup_path" ]; then
+                log_error "ClickHouse backup not found or not accepted: $ch_backup_path"
+                _save_rollback_failed
+                return 1
+            fi
+            if ! restore_ch_volume "$ch_backup_path"; then
+                log_error "ClickHouse volume restore failed — manual intervention required"
+                _save_rollback_failed
+                return 1
+            fi
+            log_ok "ClickHouse volume restored"
+        fi
+        if [ -n "$rollback_ch_tag" ] && ! set_ch_tag "$rollback_ch_tag"; then
+            _save_rollback_failed
+            return 1
+        fi
+        if ! start_clickhouse; then
+            _save_rollback_failed
+            return 1
         fi
     fi
 
@@ -4656,6 +4879,37 @@ do_init() {
         exit 1
     fi
 
+    # --- Step 4.5: ClickHouse from the same build (its tag follows the DB tag) ---
+    local ch_in_use=false
+    if has_clickhouse_service; then
+        local new_ch_tag="Cloudpi_ch_${new_db_tag#Cloudpi_db_}"
+        local ch_secrets
+        ch_secrets=$(secrets_file_path)
+        if ! check_ch_secrets "$ch_secrets"; then
+            DEPLOY_IN_PROGRESS=false
+            exit 1
+        fi
+        # Adds only what is missing: the CH_USER / CH_PASSWORD secrets and the .env keys.
+        if ! "${SCRIPT_DIR}/clickhouse-setup.sh" --ch-tag "$new_ch_tag" --dir "$(dirname "$COMPOSE_FILE")" --secrets "$ch_secrets"; then
+            log_error "clickhouse-setup.sh failed — see the message above"
+            DEPLOY_IN_PROGRESS=false
+            exit 1
+        fi
+        if ! set_ch_tag "$new_ch_tag"; then
+            DEPLOY_IN_PROGRESS=false
+            exit 1
+        fi
+        local ch_image="${DOCKER_REPOSITORY}:${new_ch_tag}" ch_pull_output
+        log_info "Pulling ClickHouse image: $ch_image"
+        if ! ch_pull_output=$(run_docker pull "$ch_image" 2>&1) && ! run_docker image inspect "$ch_image" >/dev/null 2>&1; then
+            log_error "Failed to pull ClickHouse image and no local cache: $ch_image"
+            diagnose_pull_failure "$ch_image" "$ch_pull_output"
+            DEPLOY_IN_PROGRESS=false
+            exit 1
+        fi
+        ch_in_use=true
+    fi
+
     # --- Step 5: Start DB ---
     log_info "Starting DB container..."
     if ! run_compose -f "$COMPOSE_FILE" up -d db; then
@@ -4665,6 +4919,11 @@ do_init() {
     fi
     if ! wait_for_db; then
         log_error "DB failed to start — check docker logs $DB_CONTAINER"
+        DEPLOY_IN_PROGRESS=false
+        exit 1
+    fi
+
+    if [ "$ch_in_use" = true ] && ! start_clickhouse; then
         DEPLOY_IN_PROGRESS=false
         exit 1
     fi
@@ -4859,8 +5118,8 @@ usage() {
     echo "  BACKUP_ENC_CIPHER   OpenSSL cipher name (default: aes-256-cbc)"
     echo ""
     echo "Examples:"
-    echo "  ./cp_upgrade.sh --init Cloudpi_v1.0.322 Cloudpi_db_v1.0.322  # First-time install"
-    echo "  ./cp_upgrade.sh Cloudpi_v1.0.322        # Deploy new version"
+    echo "  ./cp_upgrade.sh --init Cloudpi_v1.1.074 Cloudpi_db_v1.1.074  # First-time install (adds the ClickHouse user to the secrets)"
+    echo "  ./cp_upgrade.sh Cloudpi_v1.1.074        # Deploy new version (moves ClickHouse to Cloudpi_ch_v1.1.074)"
     echo "  ./cp_upgrade.sh --status                 # Check current state"
     echo "  ./cp_upgrade.sh --history                # See deployment history"
     echo "  ./cp_upgrade.sh --restore 2              # Restore to snapshot #2"
