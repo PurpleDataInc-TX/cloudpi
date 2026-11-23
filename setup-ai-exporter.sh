@@ -14,14 +14,17 @@
 #
 # A release is a GitHub Release of the cloudpi repository. Its files (ai-exporter-manifest.json, the template and the
 # Lambda zip) are downloaded into ./ai-exporter/<tag> and checked against the SHA-256s in the manifest before use.
-# Admin keys are read from a hidden prompt (or ANTHROPIC_ADMIN_KEY / OPENAI_ADMIN_KEY) and passed to AWS only through a
-# private temporary file: never on a command line, never in a log, never in the state file.
+# That catches a damaged download. The SHA-256s come from the same release, so to also guard against a changed
+# release, pass --expect-sha256 <zip SHA-256> obtained from CloudPi through another channel.
+# Admin keys and the CloudPi external id are passed to AWS only through private temporary files: never on a command
+# line, never in a log, never in the state file. The keys are read from a hidden prompt (or ANTHROPIC_ADMIN_KEY /
+# OPENAI_ADMIN_KEY). Each stack has its own state file (.cloudpi-ai-exporter.<stack>.state, ids only).
 # Needs: the AWS CLI signed in to the account that will host the exporter, curl, sha256sum (or shasum).
 # =============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_ROOT="${AI_EXPORTER_DIR:-$SCRIPT_DIR/ai-exporter}"
-STATE_FILE="${AI_EXPORTER_STATE:-$SCRIPT_DIR/.cloudpi-ai-exporter.state}"
+STATE_FILE=""  # one per stack, set in main once --stack is known
 RELEASE_BASE="${AI_EXPORTER_RELEASE_BASE:-https://github.com/PurpleDataInc-TX/cloudpi/releases/download}"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
@@ -34,7 +37,7 @@ usage_error() { log_error "$1"; echo "Run ./setup-ai-exporter.sh --help for the 
 DRY_RUN=false ASSUME_YES=false DELETE_DATA=false
 STACK="cloudpi-ai-exporter" REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}" RELEASE="" ORG_ID="" PROVIDERS="anthropic,openai"
 BACKFILL=0 REQUESTER_MODE="full" SCHEDULE="cron(0 6 * * ? *)" ALARM_EMAIL="" CLOUDPI_ACCOUNT="" CLOUDPI_EXTERNAL_ID=""
-CODE_BUCKET="" OUTPUT_BUCKET_NAME="" OUTPUT_PREFIX="ai-billing" POSITIONAL=""
+CODE_BUCKET="" OUTPUT_BUCKET_NAME="" OUTPUT_PREFIX="ai-billing" POSITIONAL="" REGION_FLAG="" EXPECT_SHA=""
 ACCOUNT="" ZIP_SHA="" ZIP_PATH="" TEMPLATE_PATH="" WORKDIR=""
 ANTHROPIC_KEY="" OPENAI_KEY=""
 trap '[ -z "$WORKDIR" ] || rm -rf "$WORKDIR"' EXIT
@@ -79,6 +82,7 @@ Install options
   --code-bucket <name>         bucket for the Lambda zip (default cloudpi-ai-exporter-code-<account>-<region>)
   --cloudpi-account-id <id>    CloudPi's AWS account: creates the read-only role CloudPi uses to read the files
   --cloudpi-external-id <id>   required with --cloudpi-account-id
+  --expect-sha256 <sha256>     install/upgrade only a zip with this SHA-256 (from CloudPi, through another channel)
 
 General options
   --dry-run                    print what would change, change nothing
@@ -111,6 +115,16 @@ download() {  # download <url> <target>
 check_value() {  # check_value <flag> <value> <regex> <what>
     [[ "$2" =~ $3 ]] || usage_error "$1 must be $4 (got '$2')"
 }
+need_value() {  # need_value <flag> <next argument...>: the flag must be followed by a value that is not another flag
+    [ $# -ge 2 ] && [ -n "$2" ] && [[ "$2" != --* ]] || usage_error "$1 needs a value"
+}
+json_escape() { local s="${1//\\/\\\\}"; printf '%s' "${s//\"/\\\"}"; }
+private_file() {  # private_file <name>: a new temp file only this user can read
+    (umask 077; mktemp "${TMPDIR:-/tmp}/$1.XXXXXX")
+}
+aws_path() {  # a path the AWS CLI can open: on Windows (Git Bash) the CLI is a Windows program
+    if command -v cygpath > /dev/null 2>&1; then cygpath -m "$1"; else echo "$1"; fi
+}
 
 # -- release files ---------------------------------------------------------------------------------------------------
 # Downloads release <tag> into $WORK_ROOT/<tag> and checks the zip and the template against the manifest's SHA-256s.
@@ -137,6 +151,9 @@ fetch_release() {
     [ -n "$want" ] && [ "$got" = "$want" ] || die "the template is damaged: its SHA-256 is ${got:0:12}..., the release says ${want:0:12}... (download the release again)"
     want="$(json_field "$manifest" zip_sha256)"; got="$(sha256_of "$dir/$zip_file")"
     [ -n "$want" ] && [ "$got" = "$want" ] || die "the Lambda zip is damaged: its SHA-256 is ${got:0:12}..., the release says ${want:0:12}... (download the release again)"
+    if [ -n "$EXPECT_SHA" ] && [ "$got" != "$EXPECT_SHA" ]; then
+        die "the release zip (SHA-256 ${got:0:12}...) does not match --expect-sha256 ${EXPECT_SHA:0:12}...: nothing was installed"
+    fi
     ZIP_PATH="$dir/$zip_file"; TEMPLATE_PATH="$dir/$template_file"; ZIP_SHA="$want"; RELEASE="$tag"
     log_info "release $tag verified (zip SHA-256 ${ZIP_SHA:0:12}...)"
 }
@@ -176,10 +193,21 @@ upload_zip() {
     fi
 }
 
-deploy_stack() {  # deploy_stack <parameter overrides...>
+deploy_stack() {  # deploy_stack <Key=Value...>: parameters go through a private file, never on the command line
     log_step "deploying stack $STACK"
+    local params_file p first=true shown
+    params_file="$(private_file ai-exporter-params)"
+    { printf '['; for p in "$@"; do $first || printf ','; first=false; printf '"%s"' "$(json_escape "$p")"; done; printf ']\n'; } > "$params_file"
+    if $DRY_RUN; then
+        for p in "$@"; do
+            shown="$p"; [ -z "$CLOUDPI_EXTERNAL_ID" ] || shown="${shown//"$CLOUDPI_EXTERNAL_ID"/***}"
+            echo "  (dry run)   parameter $shown"
+        done
+    fi
     mutate aws cloudformation deploy --template-file "$TEMPLATE_PATH" --stack-name "$STACK" --region "$REGION" \
-        --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset --parameter-overrides "$@"
+        --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset --parameter-overrides "file://$(aws_path "$params_file")" \
+        || { rm -f "$params_file"; die "the stack deploy failed: see the stack $STACK in the CloudFormation console"; }
+    rm -f "$params_file"
 }
 
 stack_output() {  # stack_output <OutputKey>: empty when the stack or the output does not exist
@@ -213,19 +241,16 @@ read_key() {  # read_key <provider>: prints the key; from the environment, else 
 
 store_key() {  # store_key <provider> <key>: through a private temporary file, never on a command line
     local provider="$1" key="$2" output arn tmp
+    [ -n "$key" ] || die "refusing to store an empty $provider admin key"
     if [ "$provider" = "anthropic" ]; then output="AnthropicSecretArn"; else output="OpenAISecretArn"; fi
     arn="$(stack_output "$output")"
     if [ -z "$arn" ]; then
         $DRY_RUN && { echo "  (dry run) store the $provider admin key in the stack's secret"; return 0; }
         die "the stack has no $provider secret (is $provider turned on? see --providers)"
     fi
-    tmp="$(umask 077; mktemp "${TMPDIR:-/tmp}/ai-exporter-key.XXXXXX")"
+    tmp="$(private_file ai-exporter-key)"
     printf '%s' "$key" > "$tmp"
-    # On Windows (Git Bash) the AWS CLI is a Windows program: it needs a Windows path inside file://, which Git Bash
-    # does not convert on its own.
-    local file_arg="$tmp"
-    if command -v cygpath > /dev/null 2>&1; then file_arg="$(cygpath -m "$tmp")"; fi
-    mutate aws secretsmanager put-secret-value --secret-id "$arn" --secret-string "file://$file_arg" --region "$REGION" > /dev/null || { rm -f "$tmp"; die "could not store the $provider admin key"; }
+    mutate aws secretsmanager put-secret-value --secret-id "$arn" --secret-string "file://$(aws_path "$tmp")" --region "$REGION" > /dev/null || { rm -f "$tmp"; die "could not store the $provider admin key"; }
     rm -f "$tmp"
     log_info "$provider admin key stored in Secrets Manager"
 }
@@ -238,8 +263,12 @@ save_state() {  # ids and names only, never a key
 }
 state_get() { sed -n "s/^$1=//p" "$STATE_FILE" | head -n 1; }
 load_state() {
-    [ -f "$STATE_FILE" ] || die "no install found ($STATE_FILE is missing): run ./setup-ai-exporter.sh install first"
-    STACK="$(state_get STACK)"; REGION="$(state_get REGION)"; RELEASE="$(state_get RELEASE)"
+    [ -f "$STATE_FILE" ] || die "no install found for stack $STACK ($STATE_FILE is missing): run ./setup-ai-exporter.sh install first, or pass --stack <name>"
+    local saved_region; saved_region="$(state_get REGION)"
+    if [ -n "$REGION_FLAG" ] && [ "$REGION_FLAG" != "$saved_region" ]; then
+        die "the stack $STACK is installed in region $saved_region, not $REGION_FLAG"
+    fi
+    STACK="$(state_get STACK)"; REGION="$saved_region"; RELEASE="$(state_get RELEASE)"
     CODE_BUCKET="$(state_get CODE_BUCKET)"; ORG_ID="$(state_get ORG_ID)"; PROVIDERS="$(state_get PROVIDERS)"
 }
 
@@ -248,8 +277,16 @@ show_plan() {  # a dry run of today's plan: which provider-months the next run w
     fn="$(stack_output FunctionName)"
     [ -n "$fn" ] || { $DRY_RUN && return 0; die "the stack has no function output"; }
     out="$WORKDIR/plan.json"
-    query aws lambda invoke --function-name "$fn" --payload '{"mode": "plan", "dry_run": true}' \
-        --cli-binary-format raw-in-base64-out --region "$REGION" "$out" > /dev/null || die "the dry run of the exporter failed (see its CloudWatch logs)"
+    # `aws lambda invoke` succeeds even when the function crashes: the crash is only in FunctionError and the payload.
+    local function_error
+    function_error="$(query aws lambda invoke --function-name "$fn" --payload '{"mode": "plan", "dry_run": true}' \
+        --cli-binary-format raw-in-base64-out --region "$REGION" --query FunctionError --output text "$out")" \
+        || die "the dry run of the exporter could not be started"
+    if [ -n "$function_error" ] && [ "$function_error" != "None" ]; then
+        log_error "the exporter's dry run failed ($function_error):"
+        cat "$out" >&2; echo >&2
+        die "fix the problem above (see also the function's CloudWatch logs), then run the install again"
+    fi
     log_info "the next run will collect:"
     cat "$out"; echo
 }
@@ -315,7 +352,10 @@ cmd_set_key() {
     load_state
     need_tool aws
     provider_on "$provider" || die "$provider is not turned on in this install"
-    store_key "$provider" "$(read_key "$provider")"
+    # Read into a variable first: a failed read must stop here, not pass an empty key on to store_key.
+    local key
+    key="$(read_key "$provider")"
+    store_key "$provider" "$key"
 }
 
 cmd_run_now() {
@@ -342,18 +382,34 @@ cmd_status() {
     latest="$(query aws s3api list-objects-v2 --bucket "$bucket" --prefix "$prefix/_runs/" --region "$REGION" \
         --query "sort_by(Contents, &LastModified)[-1].Key" --output text 2>/dev/null || true)"
     if [ -z "$latest" ] || [ "$latest" = "None" ]; then echo "last run: none yet"; return 0; fi
-    echo "last run: $latest"
-    query aws s3 cp "s3://$bucket/$latest" - --region "$REGION" 2>/dev/null || true
+    # A run writes one log per provider-month: show them all, so a failure is never hidden behind a newer success.
+    local run_dir="${latest%/*}/" keys key
+    echo "last run: ${run_dir%/}"
+    keys="$(query aws s3api list-objects-v2 --bucket "$bucket" --prefix "$run_dir" --region "$REGION" \
+        --query "Contents[].Key" --output text 2>/dev/null || true)"
+    for key in $keys; do
+        echo "--- ${key##*/}"
+        query aws s3 cp "s3://$bucket/$key" - --region "$REGION" 2>/dev/null || true
+    done
 }
 
 cmd_uninstall() {
     load_state
     need_tool aws
-    local bucket answer
+    local bucket answer what versioning
     bucket="$(stack_output OutputBucketName)"
+    what="the stack $STACK in $REGION"
+    if $DELETE_DATA && [ -n "$bucket" ]; then
+        what="$what AND all FOCUS billing files in s3://$bucket (this cannot be undone)"
+        # Checked before anything is deleted: s3 rm leaves old versions behind, so delete-bucket would fail later.
+        versioning="$(query aws s3api get-bucket-versioning --bucket "$bucket" --region "$REGION" --query Status --output text 2>/dev/null || true)"
+        if [ "$versioning" = "Enabled" ] || [ "$versioning" = "Suspended" ]; then
+            die "the bucket $bucket has versioning turned on, so --delete-data cannot remove every file version: nothing was deleted. Empty the bucket (all versions) in the S3 console first, or uninstall without --delete-data"
+        fi
+    fi
     if ! $ASSUME_YES; then
-        [ -t 0 ] || die "uninstall deletes the stack $STACK: confirm by running it in a terminal, or add --yes"
-        read -r -p "Delete the stack $STACK in $REGION? Type yes: " answer
+        [ -t 0 ] || die "uninstall deletes $what: confirm by running it in a terminal, or add --yes"
+        read -r -p "Delete $what? Type yes: " answer
         [ "$answer" = "yes" ] || die "not deleted"
     fi
     log_step "deleting stack $STACK"
@@ -381,20 +437,21 @@ main() {
     esac
     while [ $# -gt 0 ]; do
         case "$1" in
-            --release) RELEASE="${2:-}"; shift 2 ;;
-            --org-id) ORG_ID="${2:-}"; shift 2 ;;
-            --providers) PROVIDERS="${2:-}"; shift 2 ;;
-            --region) REGION="${2:-}"; shift 2 ;;
-            --stack) STACK="${2:-}"; shift 2 ;;
-            --backfill-months) BACKFILL="${2:-}"; shift 2 ;;
-            --requester-mode) REQUESTER_MODE="${2:-}"; shift 2 ;;
-            --schedule) SCHEDULE="${2:-}"; shift 2 ;;
-            --alarm-email) ALARM_EMAIL="${2:-}"; shift 2 ;;
-            --output-bucket) OUTPUT_BUCKET_NAME="${2:-}"; shift 2 ;;
-            --output-prefix) OUTPUT_PREFIX="${2:-}"; shift 2 ;;
-            --code-bucket) CODE_BUCKET="${2:-}"; shift 2 ;;
-            --cloudpi-account-id) CLOUDPI_ACCOUNT="${2:-}"; shift 2 ;;
-            --cloudpi-external-id) CLOUDPI_EXTERNAL_ID="${2:-}"; shift 2 ;;
+            --release) need_value "$@"; RELEASE="$2"; shift 2 ;;
+            --org-id) need_value "$@"; ORG_ID="$2"; shift 2 ;;
+            --providers) need_value "$@"; PROVIDERS="$2"; shift 2 ;;
+            --region) need_value "$@"; REGION="$2"; REGION_FLAG="$2"; shift 2 ;;
+            --stack) need_value "$@"; STACK="$2"; shift 2 ;;
+            --backfill-months) need_value "$@"; BACKFILL="$2"; shift 2 ;;
+            --requester-mode) need_value "$@"; REQUESTER_MODE="$2"; shift 2 ;;
+            --schedule) need_value "$@"; SCHEDULE="$2"; shift 2 ;;
+            --alarm-email) need_value "$@"; ALARM_EMAIL="$2"; shift 2 ;;
+            --output-bucket) need_value "$@"; OUTPUT_BUCKET_NAME="$2"; shift 2 ;;
+            --output-prefix) need_value "$@"; OUTPUT_PREFIX="$2"; shift 2 ;;
+            --code-bucket) need_value "$@"; CODE_BUCKET="$2"; shift 2 ;;
+            --cloudpi-account-id) need_value "$@"; CLOUDPI_ACCOUNT="$2"; shift 2 ;;
+            --cloudpi-external-id) need_value "$@"; CLOUDPI_EXTERNAL_ID="$2"; shift 2 ;;
+            --expect-sha256) need_value "$@"; EXPECT_SHA="$2"; shift 2 ;;
             --dry-run) DRY_RUN=true; shift ;;
             --yes) ASSUME_YES=true; shift ;;
             --delete-data) DELETE_DATA=true; shift ;;
@@ -403,6 +460,9 @@ main() {
             *) [ -z "$POSITIONAL" ] || usage_error "unexpected argument '$1'"; POSITIONAL="$1"; shift ;;
         esac
     done
+    check_value --stack "$STACK" '^[A-Za-z][A-Za-z0-9-]{0,127}$' "a CloudFormation stack name (letters, digits, '-')"
+    [ -z "$EXPECT_SHA" ] || check_value --expect-sha256 "$EXPECT_SHA" '^[0-9a-f]{64}$' "a SHA-256 (64 lowercase hex characters)"
+    STATE_FILE="${AI_EXPORTER_STATE:-${AI_EXPORTER_STATE_DIR:-$SCRIPT_DIR}/.cloudpi-ai-exporter.$STACK.state}"
     case "$cmd" in
         install) cmd_install ;;
         upgrade) cmd_upgrade ;;

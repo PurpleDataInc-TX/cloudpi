@@ -29,13 +29,15 @@ setup_env() {
   export AI_EXPORTER_RELEASE_BASE="https://example.invalid/releases/download" AI_EXPORTER_DIR="$T/work"
   export AI_EXPORTER_STATE="$T/state" AWS_REGION="us-east-1" PATH="$HERE/fakebin:$PATH"
   export ANTHROPIC_ADMIN_KEY="$ANT_KEY" OPENAI_ADMIN_KEY="$OAI_KEY"
-  mkdir -p "$FAKE_AWS_DIR" && : > "$FAKE_AWS_LOG"
+  export TMPDIR="$T/tmp"  # so the temp-key check below looks where the script really writes
+  mkdir -p "$FAKE_AWS_DIR" "$TMPDIR" && : > "$FAKE_AWS_LOG"
   make_release ai-exporter-1.0.0 1.0.0
 }
 
 run() { OUT="$("$SCRIPT" "$@" < /dev/null 2>&1)"; CODE=$?; }
 install_ok() { run install --release ai-exporter-1.0.0 --org-id 44 "$@"; }
 log_has() { grep -qF -- "$1" "$FAKE_AWS_LOG"; }
+params_has() { [ -f "$FAKE_AWS_DIR/deploy-params.json" ] && grep -qF -- "\"$1" "$FAKE_AWS_DIR/deploy-params.json"; }
 expect() {  # expect <what> [!] <command...>: a leading ! means the command must fail
   local what="$1" negate=false ok=false; shift
   if [ "${1:-}" = "!" ]; then negate=true; shift; fi
@@ -70,9 +72,11 @@ t_install_deploys_and_stores_keys() {
   expect "zip uploaded under its sha" log_has "s3://cloudpi-ai-exporter-code-123456789012-us-east-1/ai-exporter/bundle-$zsha.zip" &&
   expect "stack deployed" log_has "cloudformation deploy --template-file" &&
   expect "stack name" log_has "--stack-name cloudpi-ai-exporter" &&
-  expect "IAM capability" log_has "--capabilities CAPABILITY_IAM" &&
-  expect "parameters" log_has "OrgId=44" && log_has "CodeKey=ai-exporter/bundle-$zsha.zip" &&
-  log_has "EnableAnthropic=true" && log_has "EnableOpenAI=true" && log_has "BackfillMonths=3" &&
+  expect "IAM capability" log_has "--capabilities CAPABILITY_NAMED_IAM" &&
+  expect "parameters from a private file" log_has "--parameter-overrides file://" &&
+  expect "parameters" params_has "OrgId=44" && params_has "CodeKey=ai-exporter/bundle-$zsha.zip" &&
+  params_has "EnableAnthropic=true" && params_has "EnableOpenAI=true" && params_has "BackfillMonths=3" &&
+  params_has "ScheduleExpression=cron(0 6 * * ? *)" &&
   expect "anthropic key stored" [ "$(cat "$FAKE_AWS_DIR/secret-anthropic-AbCdEf")" = "$ANT_KEY" ] &&
   expect "openai key stored" [ "$(cat "$FAKE_AWS_DIR/secret-openai-GhIjKl")" = "$OAI_KEY" ] &&
   expect "keys passed as files" log_has "--secret-string file://" &&
@@ -99,8 +103,8 @@ t_openai_only() {
   unset ANTHROPIC_ADMIN_KEY
   touch "$FAKE_AWS_DIR/no-anthropic"
   install_ok --providers openai
-  expect "exit 0 ($OUT)" [ "$CODE" -eq 0 ] && expect "anthropic off" log_has "EnableAnthropic=false" &&
-  expect "openai on" log_has "EnableOpenAI=true" && expect "no anthropic secret" [ ! -f "$FAKE_AWS_DIR/secret-anthropic-AbCdEf" ]
+  expect "exit 0 ($OUT)" [ "$CODE" -eq 0 ] && expect "anthropic off" params_has "EnableAnthropic=false" &&
+  expect "openai on" params_has "EnableOpenAI=true" && expect "no anthropic secret" [ ! -f "$FAKE_AWS_DIR/secret-anthropic-AbCdEf" ]
 }
 
 t_bad_providers_refused() { install_ok --providers bedrock; expect "refused" [ "$CODE" -ne 0 ] && expect "message" grep -q "providers" <<< "$OUT"; }
@@ -134,8 +138,8 @@ t_upgrade_deploys_the_new_zip_and_keeps_settings() {
   make_release ai-exporter-1.1.0 1.1.0
   run upgrade ai-exporter-1.1.0
   local zsha; zsha="$(sha "$FAKE_RELEASE_DIR/ai-exporter-1.1.0/ai-exporter-1.1.0.zip")"
-  expect "exit 0 ($OUT)" [ "$CODE" -eq 0 ] && expect "new code key" log_has "CodeKey=ai-exporter/bundle-$zsha.zip" &&
-  expect "other settings untouched (kept by CloudFormation)" ! log_has "OrgId=" &&
+  expect "exit 0 ($OUT)" [ "$CODE" -eq 0 ] && expect "new code key" params_has "CodeKey=ai-exporter/bundle-$zsha.zip" &&
+  expect "other settings untouched (kept by CloudFormation)" ! params_has "OrgId=" &&
   expect "keys not asked again" ! log_has "put-secret-value" &&
   expect "state updated" grep -q "^RELEASE=ai-exporter-1.1.0$" "$AI_EXPORTER_STATE"
 }
@@ -175,6 +179,71 @@ t_uninstall_delete_data_removes_the_bucket() {
   run uninstall --yes --delete-data
   expect "exit 0 ($OUT)" [ "$CODE" -eq 0 ] && expect "files removed" log_has "s3 rm s3://cloudpi-ai-focus-123456789012-us-east-1 --recursive" &&
   expect "bucket removed" log_has "s3api delete-bucket --bucket cloudpi-ai-focus-123456789012-us-east-1"
+}
+
+# ---------- review fixes (PR #14) ----------
+
+t_dry_run_reports_a_crashing_lambda() {
+  touch "$FAKE_AWS_DIR/lambda-error"
+  install_ok
+  expect "fails" [ "$CODE" -ne 0 ] && expect "says the dry run failed" grep -q "dry run failed" <<< "$OUT" &&
+  expect "shows the function's error" grep -q "ConfigError" <<< "$OUT" &&
+  expect "not presented as a plan" ! grep -q "the next run will collect" <<< "$OUT"
+}
+
+t_set_key_with_no_key_never_overwrites_the_secret() {
+  install_ok; printf 'working-key' > "$FAKE_AWS_DIR/secret-openai-GhIjKl"; : > "$FAKE_AWS_LOG"
+  unset OPENAI_ADMIN_KEY
+  run set-key openai
+  expect "fails" [ "$CODE" -ne 0 ] && expect "names the variable" grep -q "OPENAI_ADMIN_KEY" <<< "$OUT" &&
+  expect "secret untouched" [ "$(cat "$FAKE_AWS_DIR/secret-openai-GhIjKl")" = "working-key" ] &&
+  expect "nothing stored" ! log_has "put-secret-value"
+}
+
+t_flag_without_a_value_is_refused() {
+  run install --org-id 44 --release; expect "fails with a message" [ "$CODE" -eq 2 ] && expect "names the flag" grep -q -- "--release needs a value" <<< "$OUT" &&
+  run install --release --org-id 44; expect "next flag is not taken as the value" [ "$CODE" -eq 2 ] && expect "names the flag" grep -q -- "--release needs a value" <<< "$OUT"
+}
+
+t_delete_data_prompt_names_the_billing_files_and_versioned_buckets_are_refused() {
+  install_ok
+  run uninstall --delete-data
+  expect "refuses without a terminal" [ "$CODE" -ne 0 ] && expect "warns about the billing files" grep -q "FOCUS billing files" <<< "$OUT" &&
+  touch "$FAKE_AWS_DIR/versioned"; : > "$FAKE_AWS_LOG"
+  run uninstall --yes --delete-data
+  expect "refused" [ "$CODE" -ne 0 ] && expect "says versioning" grep -q "versioning" <<< "$OUT" &&
+  expect "stack not deleted first" ! log_has "delete-stack"
+}
+
+t_state_is_kept_per_stack() {
+  unset AI_EXPORTER_STATE; export AI_EXPORTER_STATE_DIR="$T"
+  install_ok && install_ok --stack second-exporter
+  expect "two state files" [ -f "$T/.cloudpi-ai-exporter.cloudpi-ai-exporter.state" ] && [ -f "$T/.cloudpi-ai-exporter.second-exporter.state" ] &&
+  expect "each remembers its stack" grep -q "^STACK=second-exporter$" "$T/.cloudpi-ai-exporter.second-exporter.state" &&
+  run status --stack unknown-stack; expect "unknown stack refused" [ "$CODE" -ne 0 ] && expect "message" grep -q "no install found" <<< "$OUT" &&
+  run status --region eu-west-1; expect "different region refused" [ "$CODE" -ne 0 ] && expect "message" grep -q "region" <<< "$OUT"
+}
+
+t_external_id_is_never_on_a_command_line() {
+  install_ok --cloudpi-account-id 210987654321 --cloudpi-external-id ext-secret-123
+  expect "exit 0 ($OUT)" [ "$CODE" -eq 0 ] && expect "not on any aws command line" ! log_has "ext-secret-123" &&
+  expect "passed in the private file" params_has "CloudPiExternalId=ext-secret-123" &&
+  expect "params file removed" [ -z "$(find "$T/tmp" -name 'ai-exporter-params.*' 2>/dev/null)" ]
+}
+
+t_expected_sha256_pins_the_release() {
+  install_ok --expect-sha256 0000000000000000000000000000000000000000000000000000000000000000
+  expect "refused" [ "$CODE" -ne 0 ] && expect "says it does not match" grep -q "does not match --expect-sha256" <<< "$OUT" &&
+  expect "nothing deployed" ! log_has "cloudformation deploy" &&
+  install_ok --expect-sha256 "$(sha "$FAKE_RELEASE_DIR/ai-exporter-1.0.0/ai-exporter-1.0.0.zip")"
+  expect "accepted when it matches ($OUT)" [ "$CODE" -eq 0 ]
+}
+
+t_status_shows_every_log_of_the_latest_run() {
+  install_ok
+  run status
+  expect "exit 0 ($OUT)" [ "$CODE" -eq 0 ] && expect "anthropic log shown" grep -q '"provider": "anthropic"' <<< "$OUT" &&
+  expect "its failure visible" grep -q '"status": "failed"' <<< "$OUT" && expect "openai log shown" grep -q '"provider": "openai"' <<< "$OUT"
 }
 
 TESTS=$(declare -F | awk '{print $3}' | grep '^t_')

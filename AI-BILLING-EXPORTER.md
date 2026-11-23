@@ -35,6 +35,14 @@ Useful options: `--providers openai` (only one provider), `--backfill-months 6` 
 (hash user ids, names and e-mails), `--cloudpi-account-id` with `--cloudpi-external-id` (create the read-only role
 CloudPi uses to read the files). Add `--dry-run` to see every change without making it. `--help` lists everything.
 
+**Checking the download.** The installer checks the zip and the template against the SHA-256s in the release's
+manifest, which catches a damaged download. Because the manifest comes from the same release, it does not prove the
+release itself is genuine: for that, get the zip's SHA-256 from CloudPi through another channel and pass it with
+`--expect-sha256 <sha256>`; the install then stops unless the zip matches exactly.
+
+Each stack has its own small state file next to the script (`.cloudpi-ai-exporter.<stack>.state`, ids only). Use
+`--stack <name>` with every command to manage a second install.
+
 ## What it creates
 
 | Resource | Purpose |
@@ -75,7 +83,7 @@ Only cost and usage totals are collected, never prompts or responses.
 | Run now instead of waiting | `./setup-ai-exporter.sh run-now` |
 | New admin key (rotation) | `./setup-ai-exporter.sh set-key anthropic` (or `openai`) |
 | Move to a new release | `./setup-ai-exporter.sh upgrade ai-exporter-1.1.0` (settings and keys stay) |
-| Remove | `./setup-ai-exporter.sh uninstall` (add `--delete-data` to also delete the bucket and its files) |
+| Remove | `./setup-ai-exporter.sh uninstall` (add `--delete-data` to also delete the bucket and all its billing files; it refuses a bucket with versioning turned on, since old versions would remain) |
 
 ## Troubleshooting
 

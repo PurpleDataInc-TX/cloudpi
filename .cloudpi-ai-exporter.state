@@ -1,0 +1,6 @@
+STACK=second-exporter
+REGION=us-east-1
+RELEASE=ai-exporter-1.0.0
+CODE_BUCKET=cloudpi-ai-exporter-code-123456789012-us-east-1
+ORG_ID=44
+PROVIDERS=anthropic,openai
