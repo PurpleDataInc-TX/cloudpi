@@ -246,6 +246,45 @@ t_status_shows_every_log_of_the_latest_run() {
   expect "its failure visible" grep -q '"status": "failed"' <<< "$OUT" && expect "openai log shown" grep -q '"provider": "openai"' <<< "$OUT"
 }
 
+t_expected_template_sha256_pins_the_template() {
+  install_ok --expect-template-sha256 1111111111111111111111111111111111111111111111111111111111111111
+  expect "refused" [ "$CODE" -ne 0 ] && expect "says it does not match" grep -q "does not match --expect-template-sha256" <<< "$OUT" &&
+  expect "nothing deployed" ! log_has "cloudformation deploy" &&
+  install_ok --expect-template-sha256 "$(sha "$FAKE_RELEASE_DIR/ai-exporter-1.0.0/ai-exporter-template.yaml")"              --expect-sha256 "$(sha "$FAKE_RELEASE_DIR/ai-exporter-1.0.0/ai-exporter-1.0.0.zip")"
+  expect "accepted when both match ($OUT)" [ "$CODE" -eq 0 ]
+}
+
+t_key_file_lives_in_the_work_folder_and_is_gone_after() {
+  install_ok
+  local path; path="$(cat "$FAKE_AWS_DIR/last-key-path")"
+  expect "key file was used ($OUT)" [ -n "$path" ] && expect "file removed" [ ! -e "$path" ] &&
+  expect "its folder removed too (so Ctrl-C cannot leave it behind)" [ ! -e "$(dirname "$path")" ] &&
+  run set-key openai; path="$(cat "$FAKE_AWS_DIR/last-key-path")"
+  expect "set-key ok ($OUT)" [ "$CODE" -eq 0 ] && expect "set-key folder removed" [ ! -e "$(dirname "$path")" ]
+}
+
+t_setting_with_a_line_break_is_refused() {
+  install_ok --alarm-email "$(printf 'ops@example.com
+x')"
+  expect "refused" [ "$CODE" -ne 0 ] && expect "names the setting" grep -q "AlarmEmail" <<< "$OUT" &&
+  expect "nothing deployed" ! log_has "cloudformation deploy"
+}
+
+t_delete_data_stops_when_versioning_cannot_be_checked() {
+  install_ok; touch "$FAKE_AWS_DIR/versioning-denied"; : > "$FAKE_AWS_LOG"
+  run uninstall --yes --delete-data
+  expect "refused" [ "$CODE" -ne 0 ] && expect "says why" grep -q "could not check whether the bucket" <<< "$OUT" &&
+  expect "stack not deleted" ! log_has "delete-stack" && expect "files not deleted" ! log_has "s3 rm"
+}
+
+t_install_in_another_region_does_not_overwrite_the_stack_state() {
+  install_ok
+  local before; before="$(cat "$AI_EXPORTER_STATE")"
+  install_ok --region eu-west-1
+  expect "refused" [ "$CODE" -ne 0 ] && expect "points to --stack" grep -q -- "--stack <another name>" <<< "$OUT" &&
+  expect "state untouched" [ "$(cat "$AI_EXPORTER_STATE")" = "$before" ]
+}
+
 TESTS=$(declare -F | awk '{print $3}' | grep '^t_')
 for t in $TESTS; do
   if ( setup_env; "$t" ); then PASS=$((PASS + 1)); echo "ok   $t"; else FAIL=$((FAIL + 1)); FAILED+=("$t"); echo "FAIL $t"; fi

@@ -14,7 +14,9 @@ case "$args" in
   "s3api head-bucket"*) [ -f "$FAKE_AWS_DIR/bucket" ] || exit 254 ;;
   "s3api create-bucket"*) touch "$FAKE_AWS_DIR/bucket" ;;
   "s3api head-object"*) exit 254 ;;
-  "s3api get-bucket-versioning"*) [ -f "$FAKE_AWS_DIR/versioned" ] && echo "Enabled" || echo "None" ;;
+  "s3api get-bucket-versioning"*)
+    [ -f "$FAKE_AWS_DIR/versioning-denied" ] && { echo "An error occurred (AccessDenied)" >&2; exit 254; }
+    [ -f "$FAKE_AWS_DIR/versioned" ] && echo "Enabled" || echo "None" ;;
   "s3api list-objects-v2"*"Contents[].Key"*) printf '%s\t%s\n' "$RUN/anthropic-2026-11.json" "$RUN/openai-2026-11.json" ;;
   "s3api list-objects-v2"*) echo "$RUN/openai-2026-11.json" ;;
   "s3 cp s3://"*"anthropic-2026-11.json"*) echo '{"status": "failed", "provider": "anthropic", "month": "2026-11"}' ;;
@@ -37,7 +39,7 @@ case "$args" in
     esac ;;
   "secretsmanager put-secret-value"*)
     id="$(arg_after --secret-id "$@")"; src="$(arg_after --secret-string "$@")"
-    cp "${src#file://}" "$FAKE_AWS_DIR/secret-${id##*/}" ;;
+    cp "${src#file://}" "$FAKE_AWS_DIR/secret-${id##*/}"; echo "${src#file://}" > "$FAKE_AWS_DIR/last-key-path" ;;
   "lambda invoke"*)
     out="${*: -1}"
     if [ -f "$FAKE_AWS_DIR/lambda-error" ]; then

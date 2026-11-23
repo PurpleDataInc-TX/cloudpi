@@ -15,7 +15,7 @@
 # A release is a GitHub Release of the cloudpi repository. Its files (ai-exporter-manifest.json, the template and the
 # Lambda zip) are downloaded into ./ai-exporter/<tag> and checked against the SHA-256s in the manifest before use.
 # That catches a damaged download. The SHA-256s come from the same release, so to also guard against a changed
-# release, pass --expect-sha256 <zip SHA-256> obtained from CloudPi through another channel.
+# release, pass --expect-sha256 and --expect-template-sha256 obtained from CloudPi through another channel.
 # Admin keys and the CloudPi external id are passed to AWS only through private temporary files: never on a command
 # line, never in a log, never in the state file. The keys are read from a hidden prompt (or ANTHROPIC_ADMIN_KEY /
 # OPENAI_ADMIN_KEY). Each stack has its own state file (.cloudpi-ai-exporter.<stack>.state, ids only).
@@ -37,7 +37,7 @@ usage_error() { log_error "$1"; echo "Run ./setup-ai-exporter.sh --help for the 
 DRY_RUN=false ASSUME_YES=false DELETE_DATA=false
 STACK="cloudpi-ai-exporter" REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}" RELEASE="" ORG_ID="" PROVIDERS="anthropic,openai"
 BACKFILL=0 REQUESTER_MODE="full" SCHEDULE="cron(0 6 * * ? *)" ALARM_EMAIL="" CLOUDPI_ACCOUNT="" CLOUDPI_EXTERNAL_ID=""
-CODE_BUCKET="" OUTPUT_BUCKET_NAME="" OUTPUT_PREFIX="ai-billing" POSITIONAL="" REGION_FLAG="" EXPECT_SHA=""
+CODE_BUCKET="" OUTPUT_BUCKET_NAME="" OUTPUT_PREFIX="ai-billing" POSITIONAL="" REGION_FLAG="" EXPECT_SHA="" EXPECT_TEMPLATE_SHA=""
 ACCOUNT="" ZIP_SHA="" ZIP_PATH="" TEMPLATE_PATH="" WORKDIR=""
 ANTHROPIC_KEY="" OPENAI_KEY=""
 trap '[ -z "$WORKDIR" ] || rm -rf "$WORKDIR"' EXIT
@@ -83,6 +83,8 @@ Install options
   --cloudpi-account-id <id>    CloudPi's AWS account: creates the read-only role CloudPi uses to read the files
   --cloudpi-external-id <id>   required with --cloudpi-account-id
   --expect-sha256 <sha256>     install/upgrade only a zip with this SHA-256 (from CloudPi, through another channel)
+  --expect-template-sha256 <sha256>
+                               install/upgrade only a template with this SHA-256 (use both pins together)
 
 General options
   --dry-run                    print what would change, change nothing
@@ -119,8 +121,9 @@ need_value() {  # need_value <flag> <next argument...>: the flag must be followe
     [ $# -ge 2 ] && [ -n "$2" ] && [[ "$2" != --* ]] || usage_error "$1 needs a value"
 }
 json_escape() { local s="${1//\\/\\\\}"; printf '%s' "${s//\"/\\\"}"; }
-private_file() {  # private_file <name>: a new temp file only this user can read
-    (umask 077; mktemp "${TMPDIR:-/tmp}/$1.XXXXXX")
+private_file() {  # private_file <name>: a new file only this user can read, inside $WORKDIR (removed on any exit)
+    [ -n "$WORKDIR" ] || die "internal error: no work folder for a private file"
+    (umask 077; mktemp "$WORKDIR/$1.XXXXXX")
 }
 aws_path() {  # a path the AWS CLI can open: on Windows (Git Bash) the CLI is a Windows program
     if command -v cygpath > /dev/null 2>&1; then cygpath -m "$1"; else echo "$1"; fi
@@ -153,6 +156,10 @@ fetch_release() {
     [ -n "$want" ] && [ "$got" = "$want" ] || die "the Lambda zip is damaged: its SHA-256 is ${got:0:12}..., the release says ${want:0:12}... (download the release again)"
     if [ -n "$EXPECT_SHA" ] && [ "$got" != "$EXPECT_SHA" ]; then
         die "the release zip (SHA-256 ${got:0:12}...) does not match --expect-sha256 ${EXPECT_SHA:0:12}...: nothing was installed"
+    fi
+    got="$(sha256_of "$dir/$template_file")"
+    if [ -n "$EXPECT_TEMPLATE_SHA" ] && [ "$got" != "$EXPECT_TEMPLATE_SHA" ]; then
+        die "the release template (SHA-256 ${got:0:12}...) does not match --expect-template-sha256 ${EXPECT_TEMPLATE_SHA:0:12}...: nothing was installed"
     fi
     ZIP_PATH="$dir/$zip_file"; TEMPLATE_PATH="$dir/$template_file"; ZIP_SHA="$want"; RELEASE="$tag"
     log_info "release $tag verified (zip SHA-256 ${ZIP_SHA:0:12}...)"
@@ -196,6 +203,9 @@ upload_zip() {
 deploy_stack() {  # deploy_stack <Key=Value...>: parameters go through a private file, never on the command line
     log_step "deploying stack $STACK"
     local params_file p first=true shown
+    for p in "$@"; do
+        [[ "$p" != *[[:cntrl:]]* ]] || die "the setting '${p%%=*}' contains a line break or another control character"
+    done
     params_file="$(private_file ai-exporter-params)"
     { printf '['; for p in "$@"; do $first || printf ','; first=false; printf '"%s"' "$(json_escape "$p")"; done; printf ']\n'; } > "$params_file"
     if $DRY_RUN; then
@@ -301,6 +311,10 @@ cmd_install() {
     check_value --requester-mode "$REQUESTER_MODE" '^(full|hashed)$' "full or hashed"
     [ -z "$CLOUDPI_ACCOUNT" ] || check_value --cloudpi-account-id "$CLOUDPI_ACCOUNT" '^[0-9]{12}$' "a 12-digit AWS account id"
     [ -z "$CLOUDPI_ACCOUNT" ] || [ -n "$CLOUDPI_EXTERNAL_ID" ] || usage_error "--cloudpi-external-id is required with --cloudpi-account-id"
+    if [ -f "$STATE_FILE" ]; then
+        local saved_region; saved_region="$(state_get REGION)"
+        [ "$saved_region" = "$REGION" ] || die "the stack $STACK is already installed in region $saved_region: use --stack <another name> for a second install in $REGION"
+    fi
     need_tool aws; need_tool curl
     # Ask for the keys first, so a missing key stops the install before anything is created.
     if provider_on anthropic; then ANTHROPIC_KEY="$(read_key anthropic)"; fi
@@ -355,6 +369,7 @@ cmd_set_key() {
     # Read into a variable first: a failed read must stop here, not pass an empty key on to store_key.
     local key
     key="$(read_key "$provider")"
+    WORKDIR="$(mktemp -d)"
     store_key "$provider" "$key"
 }
 
@@ -402,7 +417,7 @@ cmd_uninstall() {
     if $DELETE_DATA && [ -n "$bucket" ]; then
         what="$what AND all FOCUS billing files in s3://$bucket (this cannot be undone)"
         # Checked before anything is deleted: s3 rm leaves old versions behind, so delete-bucket would fail later.
-        versioning="$(query aws s3api get-bucket-versioning --bucket "$bucket" --region "$REGION" --query Status --output text 2>/dev/null || true)"
+        versioning="$(query aws s3api get-bucket-versioning --bucket "$bucket" --region "$REGION" --query Status --output text)"             || die "could not check whether the bucket $bucket has versioning turned on: nothing was deleted"
         if [ "$versioning" = "Enabled" ] || [ "$versioning" = "Suspended" ]; then
             die "the bucket $bucket has versioning turned on, so --delete-data cannot remove every file version: nothing was deleted. Empty the bucket (all versions) in the S3 console first, or uninstall without --delete-data"
         fi
@@ -452,6 +467,7 @@ main() {
             --cloudpi-account-id) need_value "$@"; CLOUDPI_ACCOUNT="$2"; shift 2 ;;
             --cloudpi-external-id) need_value "$@"; CLOUDPI_EXTERNAL_ID="$2"; shift 2 ;;
             --expect-sha256) need_value "$@"; EXPECT_SHA="$2"; shift 2 ;;
+            --expect-template-sha256) need_value "$@"; EXPECT_TEMPLATE_SHA="$2"; shift 2 ;;
             --dry-run) DRY_RUN=true; shift ;;
             --yes) ASSUME_YES=true; shift ;;
             --delete-data) DELETE_DATA=true; shift ;;
@@ -462,6 +478,7 @@ main() {
     done
     check_value --stack "$STACK" '^[A-Za-z][A-Za-z0-9-]{0,127}$' "a CloudFormation stack name (letters, digits, '-')"
     [ -z "$EXPECT_SHA" ] || check_value --expect-sha256 "$EXPECT_SHA" '^[0-9a-f]{64}$' "a SHA-256 (64 lowercase hex characters)"
+    [ -z "$EXPECT_TEMPLATE_SHA" ] || check_value --expect-template-sha256 "$EXPECT_TEMPLATE_SHA" '^[0-9a-f]{64}$' "a SHA-256 (64 lowercase hex characters)"
     STATE_FILE="${AI_EXPORTER_STATE:-${AI_EXPORTER_STATE_DIR:-$SCRIPT_DIR}/.cloudpi-ai-exporter.$STACK.state}"
     case "$cmd" in
         install) cmd_install ;;

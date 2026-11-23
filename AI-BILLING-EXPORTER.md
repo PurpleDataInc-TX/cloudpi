@@ -37,11 +37,13 @@ CloudPi uses to read the files). Add `--dry-run` to see every change without mak
 
 **Checking the download.** The installer checks the zip and the template against the SHA-256s in the release's
 manifest, which catches a damaged download. Because the manifest comes from the same release, it does not prove the
-release itself is genuine: for that, get the zip's SHA-256 from CloudPi through another channel and pass it with
-`--expect-sha256 <sha256>`; the install then stops unless the zip matches exactly.
+release itself is genuine: for that, get both SHA-256s from CloudPi through another channel and pass them with
+`--expect-sha256 <zip sha256> --expect-template-sha256 <template sha256>`; the install then stops unless both files
+match exactly. Pin both: the template creates the IAM roles, so checking only the zip is not enough.
 
 Each stack has its own small state file next to the script (`.cloudpi-ai-exporter.<stack>.state`, ids only). Use
-`--stack <name>` with every command to manage a second install.
+`--stack <name>` with every command to manage a second install (a second install in another region also needs its
+own `--stack` name).
 
 ## What it creates
 
