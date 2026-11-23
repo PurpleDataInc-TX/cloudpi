@@ -221,7 +221,11 @@ store_key() {  # store_key <provider> <key>: through a private temporary file, n
     fi
     tmp="$(umask 077; mktemp "${TMPDIR:-/tmp}/ai-exporter-key.XXXXXX")"
     printf '%s' "$key" > "$tmp"
-    mutate aws secretsmanager put-secret-value --secret-id "$arn" --secret-string "file://$tmp" --region "$REGION" > /dev/null || { rm -f "$tmp"; die "could not store the $provider admin key"; }
+    # On Windows (Git Bash) the AWS CLI is a Windows program: it needs a Windows path inside file://, which Git Bash
+    # does not convert on its own.
+    local file_arg="$tmp"
+    if command -v cygpath > /dev/null 2>&1; then file_arg="$(cygpath -m "$tmp")"; fi
+    mutate aws secretsmanager put-secret-value --secret-id "$arn" --secret-string "file://$file_arg" --region "$REGION" > /dev/null || { rm -f "$tmp"; die "could not store the $provider admin key"; }
     rm -f "$tmp"
     log_info "$provider admin key stored in Secrets Manager"
 }
