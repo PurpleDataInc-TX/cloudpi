@@ -43,7 +43,7 @@ expect() {  # expect <what> [!] <command...>: a leading ! means the command must
   if [ "${1:-}" = "!" ]; then negate=true; shift; fi
   if "$@"; then ok=true; fi
   if [ "$ok" != "$negate" ]; then return 0; fi
-  echo "    expected: $what"; return 1
+  echo "    expected: $what"; exit 1  # ends this test (each runs in its own subshell), even mid-chain
 }
 
 t_help() { run --help; expect "exit 0" [ "$CODE" -eq 0 ] && expect "usage" grep -q "install" <<< "$OUT"; }
@@ -130,7 +130,20 @@ t_dry_run_changes_nothing() {
   install_ok --dry-run
   expect "exit 0 ($OUT)" [ "$CODE" -eq 0 ] && expect "shows the deploy" grep -q "(dry run) aws cloudformation deploy" <<< "$OUT" &&
   expect "no deploy ran" ! log_has "cloudformation deploy" && expect "no upload ran" ! log_has "s3 cp" &&
-  expect "no secrets stored" [ -z "$(ls "$FAKE_AWS_DIR" | grep secret-)" ] && expect "no state saved" [ ! -f "$AI_EXPORTER_STATE" ]
+  expect "no secrets stored" [ -z "$(ls "$FAKE_AWS_DIR" | grep secret-)" ] && expect "no state saved" [ ! -f "$AI_EXPORTER_STATE" ] &&
+  expect "never claims a change" ! grep -qE "\] (code bucket .* created|.* key stored|installed\.)" <<< "$OUT" &&
+  expect "says what it would do" grep -q "would create the code bucket" <<< "$OUT" && grep -q "would store the openai admin key" <<< "$OUT" &&
+  expect "ends saying nothing changed" grep -q "dry run finished: nothing was changed" <<< "$OUT"
+}
+
+t_dry_run_upgrade_and_run_now_claim_nothing() {
+  install_ok; : > "$FAKE_AWS_LOG"
+  run upgrade ai-exporter-1.0.0 --dry-run
+  expect "upgrade exit 0 ($OUT)" [ "$CODE" -eq 0 ] && expect "no 'upgraded' claim" ! grep -q "upgraded to" <<< "$OUT" &&
+  expect "says nothing changed" grep -q "dry run finished: nothing was changed" <<< "$OUT" &&
+  run run-now --dry-run
+  expect "run-now exit 0 ($OUT)" [ "$CODE" -eq 0 ] && expect "no 'run started' claim" ! grep -q "run started" <<< "$OUT" &&
+  expect "nothing invoked" ! log_has "lambda invoke --invocation-type Event"
 }
 
 t_upgrade_deploys_the_new_zip_and_keeps_settings() {

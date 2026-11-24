@@ -31,6 +31,10 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
+log_done() {  # log_done <what was done> <what a dry run would do>: a dry run never claims a change
+    if $DRY_RUN; then log_info "(dry run) would $2"; else log_info "$1"; fi
+}
+log_dry_run_end() { log_info "dry run finished: nothing was changed. Run the same command without --dry-run to apply it."; }
 die() { log_error "$1"; exit 1; }
 usage_error() { log_error "$1"; echo "Run ./setup-ai-exporter.sh --help for the options." >&2; exit 2; }
 
@@ -186,7 +190,7 @@ ensure_code_bucket() {
     mutate "${create[@]}"
     mutate aws s3api put-public-access-block --bucket "$CODE_BUCKET" --region "$REGION" --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
     mutate aws s3api put-bucket-encryption --bucket "$CODE_BUCKET" --region "$REGION" --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
-    log_info "code bucket $CODE_BUCKET created (private, encrypted)"
+    log_done "code bucket $CODE_BUCKET created (private, encrypted)" "create the code bucket $CODE_BUCKET (private, encrypted)"
 }
 
 code_key() { echo "ai-exporter/bundle-$ZIP_SHA.zip"; }
@@ -255,14 +259,14 @@ store_key() {  # store_key <provider> <key>: through a private temporary file, n
     if [ "$provider" = "anthropic" ]; then output="AnthropicSecretArn"; else output="OpenAISecretArn"; fi
     arn="$(stack_output "$output")"
     if [ -z "$arn" ]; then
-        $DRY_RUN && { echo "  (dry run) store the $provider admin key in the stack's secret"; return 0; }
+        $DRY_RUN && { log_done "" "store the $provider admin key in the stack's secret"; return 0; }
         die "the stack has no $provider secret (is $provider turned on? see --providers)"
     fi
     tmp="$(private_file ai-exporter-key)"
     printf '%s' "$key" > "$tmp"
     mutate aws secretsmanager put-secret-value --secret-id "$arn" --secret-string "file://$(aws_path "$tmp")" --region "$REGION" > /dev/null || { rm -f "$tmp"; die "could not store the $provider admin key"; }
     rm -f "$tmp"
-    log_info "$provider admin key stored in Secrets Manager"
+    log_done "$provider admin key stored in Secrets Manager" "store the $provider admin key in Secrets Manager"
 }
 
 # -- state -----------------------------------------------------------------------------------------------------------
@@ -339,6 +343,7 @@ cmd_install() {
     ANTHROPIC_KEY="" OPENAI_KEY=""
     save_state
     show_plan
+    if $DRY_RUN; then log_dry_run_end; return 0; fi
     local bucket; bucket="$(stack_output OutputBucketName)"
     log_info "installed. Files go to s3://${bucket:-<output bucket>}/$OUTPUT_PREFIX/ every day at the scheduled time."
     log_info "start a run now with: ./setup-ai-exporter.sh run-now"
@@ -357,6 +362,7 @@ cmd_upgrade() {
     deploy_stack "CodeBucket=$CODE_BUCKET" "CodeKey=$(code_key)"
     save_state
     show_plan
+    if $DRY_RUN; then log_dry_run_end; return 0; fi
     log_info "upgraded to $RELEASE"
 }
 
@@ -381,6 +387,7 @@ cmd_run_now() {
     [ -n "$fn" ] || die "the stack $STACK was not found in $REGION"
     mutate aws lambda invoke --invocation-type Event --function-name "$fn" --payload '{"mode": "plan"}' \
         --cli-binary-format raw-in-base64-out --region "$REGION" "$WORKDIR/run.json" > /dev/null
+    if $DRY_RUN; then log_done "" "start a run of $fn now"; log_dry_run_end; return 0; fi
     log_info "run started; see ./setup-ai-exporter.sh status in a few minutes"
 }
 
