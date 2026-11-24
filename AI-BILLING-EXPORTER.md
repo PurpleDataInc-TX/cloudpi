@@ -17,8 +17,12 @@ You can turn on one provider or both.
 
 ## Install
 
+**Start in CloudPi.** CloudPi's AI cost export onboarding screen gives you the values to install with: your org id,
+CloudPi's AWS account id and an external id. Install with them, then give CloudPi the stack outputs (bucket, prefix
+and read role) on the same screen.
+
 ```bash
-./setup-ai-exporter.sh install --release ai-exporter-1.0.0 --org-id <your CloudPi org id>
+./setup-ai-exporter.sh install --release ai-exporter-1.0.0 --org-id <org id from CloudPi>   --cloudpi-account-id <CloudPi account id> --cloudpi-external-id <external id from CloudPi>
 ```
 
 The script:
@@ -30,10 +34,11 @@ The script:
 5. stores the keys in the stack's secrets (through a private temporary file, never on a command line);
 6. shows what the next run will collect (a dry run).
 
-Useful options: `--providers openai` (only one provider), `--backfill-months 6` (collect earlier months once),
-`--alarm-email you@company.com` (be told when a run fails), `--region`, `--requester-mode hashed`
-(hash user ids, names and e-mails), `--cloudpi-account-id` with `--cloudpi-external-id` (create the read-only role
-CloudPi uses to read the files). Add `--dry-run` to see every change without making it. `--help` lists everything.
+Useful options: `--providers openai` (only one provider), `--backfill-months 6` (earlier months to collect once;
+the default 2 gives 3 months with the current one), `--alarm-email you@company.com` (be told when a run fails),
+`--region`, `--requester-mode hashed` (hash user ids, names, e-mails and API keys; **CloudPi needs the default `full`**
+for its per-user and per-key views, so use `hashed` only if the files are not for CloudPi). Add `--dry-run` to see
+every change without making it. `--help` lists everything.
 
 **Checking the download.** The installer checks the zip and the template against the SHA-256s in the release's
 manifest, which catches a damaged download. Because the manifest comes from the same release, it does not prove the
@@ -74,6 +79,13 @@ s3://cloudpi-ai-focus-<account>-<region>/ai-billing/
   _state/<provider>/months/<YYYY-MM>.json    each month's result
   _runs/<run id>/<provider>-<YYYY-MM>.json   what each run did (kept 90 days)
 ```
+
+Every file is FOCUS 1.5. Besides cost, tokens, model and token type, each row names the Anthropic workspace or OpenAI
+project (`SubAccountId` / `SubAccountName`; Anthropic's default workspace is "Default workspace"), the user and API key
+(`PrincipalId`, `CredentialId`, `RequesterDetails`), the API key again as the FOCUS resource (`ResourceId`,
+`ResourceName`, `ResourceType` = "API Key"), and tags for project rules: `workspace`, `ant_workspace`,
+`ant_api_key_id`, `ant_api_key_name`, `ant_actor` (Anthropic) and `project`, `oai_project`, `oai_api_key_name`,
+`oai_user` (OpenAI).
 
 Only cost and usage totals are collected, never prompts or responses.
 

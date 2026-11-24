@@ -40,7 +40,7 @@ usage_error() { log_error "$1"; echo "Run ./setup-ai-exporter.sh --help for the 
 
 DRY_RUN=false ASSUME_YES=false DELETE_DATA=false
 STACK="cloudpi-ai-exporter" REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}" RELEASE="" ORG_ID="" PROVIDERS="anthropic,openai"
-BACKFILL=0 REQUESTER_MODE="full" SCHEDULE="cron(0 6 * * ? *)" ALARM_EMAIL="" CLOUDPI_ACCOUNT="" CLOUDPI_EXTERNAL_ID=""
+BACKFILL=2 REQUESTER_MODE="full" SCHEDULE="cron(0 6 * * ? *)" ALARM_EMAIL="" CLOUDPI_ACCOUNT="" CLOUDPI_EXTERNAL_ID=""
 CODE_BUCKET="" OUTPUT_BUCKET_NAME="" OUTPUT_PREFIX="ai-billing" POSITIONAL="" REGION_FLAG="" EXPECT_SHA="" EXPECT_TEMPLATE_SHA=""
 ACCOUNT="" ZIP_SHA="" ZIP_PATH="" TEMPLATE_PATH="" WORKDIR=""
 ANTHROPIC_KEY="" OPENAI_KEY=""
@@ -77,8 +77,8 @@ Install options
   --providers <list>           anthropic,openai (default), anthropic or openai
   --region <region>            AWS region (default: AWS_REGION or the AWS CLI's region)
   --stack <name>               CloudFormation stack name (default cloudpi-ai-exporter)
-  --backfill-months <n>        whole months before this one to collect once (default 0)
-  --requester-mode <mode>      full (user ids, names, e-mails; default) or hashed
+  --backfill-months <n>        whole months before this one to collect once (default 2: 3 months with this one)
+  --requester-mode <mode>      full (user ids, names, e-mails; default; CloudPi needs it) or hashed
   --schedule <expression>      daily schedule, UTC (default "cron(0 6 * * ? *)")
   --alarm-email <address>      e-mail told when a run fails
   --output-bucket <name>       bucket for the FOCUS files (default cloudpi-ai-focus-<account>-<region>)

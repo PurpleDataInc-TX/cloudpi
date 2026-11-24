@@ -107,6 +107,12 @@ t_openai_only() {
   expect "openai on" params_has "EnableOpenAI=true" && expect "no anthropic secret" [ ! -f "$FAKE_AWS_DIR/secret-anthropic-AbCdEf" ]
 }
 
+t_default_backfill_is_two_months() {  # spec 147 D-3: 3 months with the current one, like CloudPi onboarding
+  install_ok
+  expect "exit 0 ($OUT)" [ "$CODE" -eq 0 ] && expect "backfill 2" params_has "BackfillMonths=2" &&
+  expect "requester mode full" params_has "RequesterMode=full"
+}
+
 t_bad_providers_refused() { install_ok --providers bedrock; expect "refused" [ "$CODE" -ne 0 ] && expect "message" grep -q "providers" <<< "$OUT"; }
 
 t_missing_key_without_a_terminal_stops_before_deploying() {
