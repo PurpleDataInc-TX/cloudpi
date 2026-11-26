@@ -304,6 +304,113 @@ t_install_in_another_region_does_not_overwrite_the_stack_state() {
   expect "state untouched" [ "$(cat "$AI_EXPORTER_STATE")" = "$before" ]
 }
 
+# ---------- gateway sources (spec 147 Phase 7a) ----------
+
+up_has() { [ -f "$FAKE_AWS_DIR/update-params.json" ] && grep -qF -- "$1" "$FAKE_AWS_DIR/update-params.json"; }
+add_gw() { run add-gateway-source --name litellm-prod --type litellm --bucket acme-litellm-logs --prefix gateway-logs "$@"; }
+
+t_add_gateway_source_changes_only_the_gateway_parameters() {
+  install_ok && add_gw --openai-projects proj_9xY,proj_2 --anthropic-workspaces wrkspc_01
+  expect "exit 0 ($OUT)" [ "$CODE" -eq 0 ] &&
+  expect "stack updated, same template" log_has "cloudformation update-stack" && log_has "--use-previous-template" &&
+  expect "IAM capability" log_has "--capabilities CAPABILITY_NAMED_IAM" &&
+  expect "waits for it" log_has "cloudformation wait stack-update-complete" &&
+  expect "sources" up_has '"ParameterKey":"GatewaySources","ParameterValue":"[{\"name\":\"litellm-prod\",\"type\":\"litellm\",\"storage\":\"s3\",\"bucket\":\"acme-litellm-logs\",\"prefix\":\"gateway-logs\",\"scope\":{\"anthropic\":{\"workspaces\":[\"wrkspc_01\"]},\"openai\":{\"projects\":[\"proj_9xY\",\"proj_2\"]}}}]"' &&
+  expect "bucket" up_has '"ParameterKey":"GatewayLogBucketArns","ParameterValue":"arn:aws:s3:::acme-litellm-logs"' &&
+  expect "objects" up_has '"ParameterKey":"GatewayLogObjectArns","ParameterValue":"arn:aws:s3:::acme-litellm-logs/gateway-logs/*"' &&
+  expect "prefix" up_has '"ParameterKey":"GatewayLogPrefixes","ParameterValue":"gateway-logs/*"' &&
+  expect "everything else as it was" up_has '{"ParameterKey":"OrgId","UsePreviousValue":true}' &&
+  up_has '{"ParameterKey":"CloudPiExternalId","UsePreviousValue":true}' &&
+  expect "remembered" grep -q "^GW_SOURCE_litellm-prod=" "$AI_EXPORTER_STATE"
+}
+
+t_add_gateway_source_options() {
+  install_ok && add_gw --openai-all --kms-key-arn arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab --no-person-ids default_user_id,svc-ci --type cloudpi_record
+  expect "exit 0 ($OUT)" [ "$CODE" -eq 0 ] &&
+  expect "all" up_has '\"openai\":\"all\"' && expect "type" up_has '\"type\":\"cloudpi_record\"' &&
+  expect "no-person ids" up_has '\"no_person_ids\":[\"default_user_id\",\"svc-ci\"]' &&
+  expect "kms" up_has '"ParameterKey":"GatewayKmsKeyArns","ParameterValue":"arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab"'
+}
+
+t_bad_gateway_sources_are_refused_before_anything_changes() {
+  install_ok
+  local bad
+  for bad in "--prefix gateway-logs" "--openai-projects p --prefix ''" "--openai-projects p --name Bad_Name" \
+             "--openai-projects p --type kong" "--openai-projects p --bucket NOT_A_BUCKET" \
+             "--openai-projects p --openai-keys k" "--openai-projects p --kms-key-arn my-key" \
+             "--openai-projects 'a b'"; do
+    eval "add_gw $bad"
+    expect "refused: $bad ($OUT)" [ "$CODE" -ne 0 ] && expect "no stack update: $bad" ! log_has "update-stack" || return 1
+  done
+}
+
+t_a_second_source_must_not_overlap_and_names_are_unique() {
+  install_ok && add_gw --openai-projects proj_9xY
+  run add-gateway-source --name kong-edge --type litellm --bucket other-logs --prefix ai --openai-projects proj_9xY,proj_3
+  expect "overlap refused" [ "$CODE" -ne 0 ] && expect "says overlap" grep -q "overlap" <<< "$OUT" &&
+  add_gw --openai-projects proj_other
+  expect "duplicate name refused" [ "$CODE" -ne 0 ] && expect "points to set-gateway-source" grep -q "set-gateway-source" <<< "$OUT" &&
+  run add-gateway-source --name kong-edge --type litellm --bucket other-logs --prefix ai --openai-projects proj_3
+  expect "a separate project is fine ($OUT)" [ "$CODE" -eq 0 ] &&
+  expect "both sources" up_has 'litellm-prod' && up_has 'kong-edge' &&
+  expect "both buckets" up_has '"ParameterValue":"arn:aws:s3:::acme-litellm-logs,arn:aws:s3:::other-logs"'
+}
+
+t_set_and_remove_a_gateway_source() {
+  install_ok && add_gw --openai-projects proj_9xY
+  run set-gateway-source --name litellm-prod --type litellm --bucket acme-litellm-logs --prefix gateway-logs --openai-projects proj_new
+  expect "set ($OUT)" [ "$CODE" -eq 0 ] && expect "new scope" up_has 'proj_new' && expect "old scope gone" ! up_has 'proj_9xY' &&
+  run remove-gateway-source --name litellm-prod
+  expect "removed ($OUT)" [ "$CODE" -eq 0 ] && expect "no sources" up_has '"ParameterKey":"GatewaySources","ParameterValue":"[]"' &&
+  expect "no read access left" up_has '"ParameterKey":"GatewayLogBucketArns","ParameterValue":""' &&
+  expect "forgotten" ! grep -q "^GW_SOURCE_litellm-prod=" "$AI_EXPORTER_STATE" &&
+  run remove-gateway-source --name litellm-prod
+  expect "unknown source refused" [ "$CODE" -ne 0 ]
+}
+
+t_account_map_entries() {
+  install_ok && add_gw --openai-projects proj_a,proj_b
+  run add-account-map --source litellm-prod --provider openai --account proj_a --model-id openai-proj-a
+  expect "added ($OUT)" [ "$CODE" -eq 0 ] &&
+  expect "map" up_has '"ParameterKey":"GatewayAccountMap","ParameterValue":"[{\"source\":\"litellm-prod\",\"provider\":\"openai\",\"account\":\"proj_a\",\"match\":{\"model_id\":\"openai-proj-a\"}}]"' &&
+  run add-account-map --source unknown --provider openai --account proj_a --model-id x
+  expect "unknown source refused" [ "$CODE" -ne 0 ] &&
+  run add-account-map --source litellm-prod --provider openai --account proj_a
+  expect "a match is required" [ "$CODE" -ne 0 ] &&
+  run remove-gateway-source --name litellm-prod
+  expect "its map goes with it" up_has '"ParameterKey":"GatewayAccountMap","ParameterValue":"[]"'
+}
+
+t_list_gateway_sources() {
+  install_ok && add_gw --openai-projects proj_9xY
+  run list-gateway-sources
+  expect "exit 0" [ "$CODE" -eq 0 ] && expect "lists it" grep -q "litellm-prod" <<< "$OUT" && grep -q "acme-litellm-logs/gateway-logs" <<< "$OUT"
+}
+
+t_gateway_dry_run_changes_nothing() {
+  install_ok && local before; before="$(cat "$AI_EXPORTER_STATE")"
+  add_gw --openai-projects proj_9xY --dry-run
+  expect "exit 0 ($OUT)" [ "$CODE" -eq 0 ] && expect "shows the update" grep -q "(dry run) aws cloudformation update-stack" <<< "$OUT" &&
+  expect "nothing called" ! log_has "update-stack" && expect "state untouched" [ "$(cat "$AI_EXPORTER_STATE")" = "$before" ]
+}
+
+t_a_release_without_gateway_support_is_refused() {
+  install_ok && touch "$FAKE_AWS_DIR/no-gateway-params"
+  add_gw --openai-projects proj_9xY
+  expect "refused" [ "$CODE" -ne 0 ] && expect "says upgrade" grep -q "upgrade" <<< "$OUT" && expect "no update" ! log_has "update-stack"
+}
+
+t_no_change_to_the_stack_is_not_an_error() {
+  install_ok && touch "$FAKE_AWS_DIR/no-updates"
+  add_gw --openai-projects proj_9xY
+  expect "exit 0 ($OUT)" [ "$CODE" -eq 0 ] && expect "says so" grep -q "already" <<< "$OUT"
+}
+
+t_reinstall_keeps_the_gateway_sources() {
+  install_ok && add_gw --openai-projects proj_9xY && install_ok
+  expect "still remembered" grep -q "^GW_SOURCE_litellm-prod=" "$AI_EXPORTER_STATE"
+}
+
 TESTS=$(declare -F | awk '{print $3}' | grep '^t_')
 for t in $TESTS; do
   if ( setup_env; "$t" ); then PASS=$((PASS + 1)); echo "ok   $t"; else FAIL=$((FAIL + 1)); FAILED+=("$t"); echo "FAIL $t"; fi

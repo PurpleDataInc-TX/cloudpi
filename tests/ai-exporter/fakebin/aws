@@ -29,6 +29,10 @@ case "$args" in
     [ -f "$FAKE_AWS_DIR/stack" ] || { echo "An error occurred (ValidationError): Stack does not exist" >&2; exit 254; }
     query="$(arg_after --query "$@")"
     case "$query" in
+      *"Parameters[].ParameterKey"*)
+        printf 'OrgId\tCodeBucket\tCodeKey\tEnableAnthropic\tEnableOpenAI\tCloudPiExternalId'
+        [ -f "$FAKE_AWS_DIR/no-gateway-params" ] || printf '\tGatewaySources\tGatewayAccountMap\tGatewayLogBucketArns\tGatewayLogObjectArns\tGatewayLogPrefixes\tGatewayKmsKeyArns'
+        echo ;;
       *StackStatus*) echo "CREATE_COMPLETE" ;;
       *FunctionName*) echo "cloudpi-ai-exporter-exporter" ;;
       *AnthropicSecretArn*) [ -f "$FAKE_AWS_DIR/no-anthropic" ] && echo "None" || echo "arn:aws:secretsmanager:us-east-1:123456789012:secret:cloudpi-ai-exporter/anthropic-AbCdEf" ;;
@@ -37,6 +41,11 @@ case "$args" in
       *OutputPrefix*) echo "ai-billing" ;;
       *) echo "None" ;;
     esac ;;
+  "cloudformation update-stack"*)
+    src="$(arg_after --parameters "$@")"
+    cp "${src#file://}" "$FAKE_AWS_DIR/update-params.json"
+    [ -f "$FAKE_AWS_DIR/no-updates" ] && { echo "An error occurred (ValidationError) when calling the UpdateStack operation: No updates are to be performed." >&2; exit 254; }
+    echo "arn:aws:cloudformation:us-east-1:123456789012:stack/cloudpi-ai-exporter/1" ;;
   "secretsmanager put-secret-value"*)
     id="$(arg_after --secret-id "$@")"; src="$(arg_after --secret-string "$@")"
     cp "${src#file://}" "$FAKE_AWS_DIR/secret-${id##*/}"; echo "${src#file://}" > "$FAKE_AWS_DIR/last-key-path" ;;

@@ -90,8 +90,21 @@ Install options
   --expect-template-sha256 <sha256>
                                install/upgrade only a template with this SHA-256 (use both pins together)
 
+Gateway sources (split each bill line per team / user by LLM-gateway logs; see AI-BILLING-EXPORTER.md)
+  add-gateway-source     read a gateway's logs: --name <name> --type litellm|cloudpi_record --bucket <log bucket>
+                         --prefix <folder, LiteLLM's s3_path> and a scope: which bill lines it may split, one per provider:
+                           --openai-projects <ids> | --openai-keys <ids> | --openai-all
+                           --anthropic-workspaces <ids> | --anthropic-keys <ids> | --anthropic-all
+                         optional: --kms-key-arn <arn> (an SSE-KMS log bucket), --no-person-ids <ids>
+  set-gateway-source     the same options: replace a source's settings
+  remove-gateway-source  --name <name>: stop reading it and remove its read access
+  add-account-map        --source <name> --provider anthropic|openai --account <workspace or project id>
+                         and --model-id / --api-base / --key-alias: which gateway calls belong to which account
+  list-gateway-sources   the sources and account map of this install
+  These change only the gateway settings of the stack (the same template and code), and keep the other settings.
+
 General options
-  --dry-run                    print what would change, change nothing
+  --dry-run                   print what would change, change nothing
   --yes                        do not ask (uninstall)
   --delete-data                uninstall: also delete the bucket and every FOCUS file in it
   -h, --help
@@ -270,10 +283,12 @@ store_key() {  # store_key <provider> <key>: through a private temporary file, n
 }
 
 # -- state -----------------------------------------------------------------------------------------------------------
-save_state() {  # ids and names only, never a key
+save_state() {  # ids and names only, never a key; the gateway sources (GW_ lines) are kept as they are
     $DRY_RUN && return 0
-    (umask 077; printf '%s\n' "STACK=$STACK" "REGION=$REGION" "RELEASE=$RELEASE" "CODE_BUCKET=$CODE_BUCKET" \
-        "ORG_ID=$ORG_ID" "PROVIDERS=$PROVIDERS" > "$STATE_FILE")
+    local gateway=""
+    [ ! -f "$STATE_FILE" ] || gateway="$(grep '^GW_' "$STATE_FILE" || true)"
+    (umask 077; { printf '%s\n' "STACK=$STACK" "REGION=$REGION" "RELEASE=$RELEASE" "CODE_BUCKET=$CODE_BUCKET" \
+        "ORG_ID=$ORG_ID" "PROVIDERS=$PROVIDERS"; [ -z "$gateway" ] || printf '%s\n' "$gateway"; } > "$STATE_FILE")
 }
 state_get() { sed -n "s/^$1=//p" "$STATE_FILE" | head -n 1; }
 load_state() {
@@ -303,6 +318,212 @@ show_plan() {  # a dry run of today's plan: which provider-months the next run w
     fi
     log_info "the next run will collect:"
     cat "$out"; echo
+}
+
+# -- gateway sources (spec 147 Phase 7a) -----------------------------------------------------------------------------
+# Each source's settings are kept in the stack's state file, written by this script only (so no JSON parser is
+# needed): GW_SOURCE_<name>=<its JSON>, GW_BUCKET_ / GW_PREFIX_ / GW_KMS_<name>, GW_SCOPE_<name>_<provider> for the
+# overlap check, and GW_MAP=<one account-map entry> lines. The stack's six gateway parameters are made from them.
+GW_NAME="" GW_TYPE="" GW_BUCKET="" GW_PREFIX="" GW_KMS="" GW_NO_PERSON=""
+ANT_WS="" ANT_KEYS="" ANT_ALL=false OAI_PROJ="" OAI_KEYS="" OAI_ALL=false
+MAP_SOURCE="" MAP_PROVIDER="" MAP_ACCOUNT="" MAP_MODEL="" MAP_API="" MAP_KEY_ALIAS=""
+GW_ID_LIST='^[A-Za-z0-9_.:-]+(,[A-Za-z0-9_.:-]+)*$'
+
+json_list() {  # json_list a,b,c -> ["a","b","c"]
+    local out="" item IFS=','
+    for item in $1; do out+="${out:+,}\"$(json_escape "$item")\""; done
+    printf '[%s]' "$out"
+}
+
+gw_scope_rule() {  # gw_scope_rule <provider> <ids for workspaces/projects> <key ids> <all?>: prints kind:ids, or ""
+    local provider="$1" accounts="$2" keys="$3" all="$4" kinds=0
+    [ -z "$accounts" ] || kinds=$((kinds + 1)); [ -z "$keys" ] || kinds=$((kinds + 1)); ! $all || kinds=$((kinds + 1))
+    [ "$kinds" -le 1 ] || usage_error "give one scope for $provider: its workspaces / projects, its API keys, or all"
+    [ -z "$accounts" ] || { check_value "--$provider scope" "$accounts" "$GW_ID_LIST" "a comma-separated list of ids"; echo "acc:$accounts"; return; }
+    [ -z "$keys" ] || { check_value "--$provider-keys" "$keys" "$GW_ID_LIST" "a comma-separated list of ids"; echo "keys:$keys"; return; }
+    ! $all || echo "all"
+}
+
+gw_scope_json() {  # gw_scope_json <provider> <rule>
+    local provider="$1" rule="$2" accounts="workspaces"
+    [ "$provider" = "anthropic" ] || accounts="projects"
+    case "$rule" in
+        all) printf '"%s":"all"' "$provider" ;;
+        acc:*) printf '"%s":{"%s":%s}' "$provider" "$accounts" "$(json_list "${rule#acc:}")" ;;
+        keys:*) printf '"%s":{"api_keys":%s}' "$provider" "$(json_list "${rule#keys:}")" ;;
+    esac
+}
+
+gw_overlaps() {  # gw_overlaps <rule a> <rule b>: true when two scopes of one provider share a bill line
+    local a="$1" b="$2" x
+    [ "$a" = "all" ] || [ "$b" = "all" ] && return 0
+    [ "${a%%:*}" = "${b%%:*}" ] || return 1
+    local IFS=','
+    for x in ${a#*:}; do [[ ",${b#*:}," == *",$x,"* ]] && return 0; done
+    return 1
+}
+
+gw_get() { sed -n "s/^$2=//p" "$1" | head -n 1; }  # gw_get <state file> <key>
+gw_names() { sed -n 's/^GW_SOURCE_\([a-z0-9-]*\)=.*/\1/p' "$1"; }
+gw_drop() {  # gw_drop <state file> <name>: forget a source and its account-map entries
+    local tmp; tmp="$(private_file ai-exporter-state)"
+    grep -v -e "^GW_SOURCE_$2=" -e "^GW_BUCKET_$2=" -e "^GW_PREFIX_$2=" -e "^GW_KMS_$2=" -e "^GW_SCOPE_$2_" \
+        -e "^GW_MAP={\"source\":\"$2\"," "$1" > "$tmp" || true
+    cat "$tmp" > "$1"; rm -f "$tmp"
+}
+
+gw_stack_params() {  # gw_stack_params <state file>: the six gateway stack parameters, as Key=Value lines
+    local file="$1" name sources="" buckets="" objects="" prefixes="" kms="" maps="" b p k
+    for name in $(gw_names "$file"); do
+        sources+="${sources:+,}$(gw_get "$file" "GW_SOURCE_$name")"
+        b="$(gw_get "$file" "GW_BUCKET_$name")"; p="$(gw_get "$file" "GW_PREFIX_$name")"; k="$(gw_get "$file" "GW_KMS_$name")"
+        [[ ",$buckets," == *",arn:aws:s3:::$b,"* ]] || buckets+="${buckets:+,}arn:aws:s3:::$b"
+        objects+="${objects:+,}arn:aws:s3:::$b/$p/*"
+        [[ ",$prefixes," == *",$p/*,"* ]] || prefixes+="${prefixes:+,}$p/*"
+        [ -z "$k" ] || [[ ",$kms," == *",$k,"* ]] || kms+="${kms:+,}$k"
+    done
+    maps="$(sed -n 's/^GW_MAP=//p' "$file" | paste -sd, -)"
+    printf '%s\n' "GatewaySources=[$sources]" "GatewayAccountMap=[$maps]" "GatewayLogBucketArns=$buckets" \
+        "GatewayLogObjectArns=$objects" "GatewayLogPrefixes=$prefixes" "GatewayKmsKeyArns=$kms"
+}
+
+update_gateway_stack() {  # update_gateway_stack <state file>: change only the gateway parameters of the stack
+    local file="$1" keys key line params_file first=true out
+    keys="$(query aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" \
+        --query "Stacks[0].Parameters[].ParameterKey" --output text)" || die "the stack $STACK was not found in $REGION"
+    [[ " $(echo $keys) " == *" GatewaySources "* ]] \
+        || die "the installed release has no gateway support: upgrade it first (./setup-ai-exporter.sh upgrade <a release with gateway sources>)"
+    local new; new="$(gw_stack_params "$file")"  # Key=Value lines (no associative arrays: macOS has bash 3.2)
+    new_value() { printf '%s
+' "$new" | sed -n "s/^$1=//p"; }
+    params_file="$(private_file ai-exporter-params)"
+    {
+        printf '['
+        for key in $keys; do
+            $first || printf ','; first=false
+            if printf '%s
+' "$new" | grep -q "^$key="; then
+                printf '{"ParameterKey":"%s","ParameterValue":"%s"}' "$key" "$(json_escape "$(new_value "$key")")"
+            else
+                printf '{"ParameterKey":"%s","UsePreviousValue":true}' "$key"
+            fi
+        done
+        printf ']\n'
+    } > "$params_file"
+    if $DRY_RUN; then
+        for key in GatewaySources GatewayAccountMap GatewayLogBucketArns GatewayLogObjectArns GatewayLogPrefixes GatewayKmsKeyArns; do
+            echo "  (dry run)   parameter $key=$(new_value "$key")"
+        done
+    fi
+    log_step "updating the gateway settings of stack $STACK (template, code and other settings unchanged)"
+    if ! out="$(mutate aws cloudformation update-stack --stack-name "$STACK" --region "$REGION" --use-previous-template \
+        --capabilities CAPABILITY_NAMED_IAM --parameters "file://$(aws_path "$params_file")" 2>&1)"; then
+        rm -f "$params_file"
+        [[ "$out" == *"No updates are to be performed"* ]] && { log_info "the stack already has these gateway settings"; return 0; }
+        die "the stack update failed: $out"
+    fi
+    rm -f "$params_file"
+    [ -z "$out" ] || echo "$out"
+    mutate aws cloudformation wait stack-update-complete --stack-name "$STACK" --region "$REGION" \
+        || die "the stack update did not finish: see the stack $STACK in the CloudFormation console"
+}
+
+gw_commit() {  # gw_commit <new state file> <what was done> <what a dry run would do>
+    update_gateway_stack "$1"
+    if $DRY_RUN; then log_done "" "$3"; log_dry_run_end; return 0; fi
+    cat "$1" > "$STATE_FILE"
+    log_done "$2" "$3"
+    log_info "the next run reads the gateway logs; see ./setup-ai-exporter.sh status afterwards (gateway coverage)"
+}
+
+cmd_gateway_source() {  # add-gateway-source / set-gateway-source
+    local mode="$1"
+    load_state
+    [ -n "$GW_NAME" ] || usage_error "--name <name> is required"
+    check_value --name "$GW_NAME" '^[a-z0-9][a-z0-9-]{0,39}$' "lower-case letters, digits and '-', at most 40 characters"
+    [[ "$GW_TYPE" =~ ^(litellm|cloudpi_record)$ ]] || usage_error "--type must be litellm or cloudpi_record (got '$GW_TYPE')"
+    [ -n "$GW_BUCKET" ] || usage_error "--bucket <log bucket> is required"
+    check_value --bucket "$GW_BUCKET" '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$' "an S3 bucket name"
+    [ -n "$GW_PREFIX" ] || usage_error "--prefix <folder> is required: LiteLLM's s3_path (the exporter may read only inside it)"
+    check_value --prefix "$GW_PREFIX" '^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$' "a folder like gateway-logs (no leading or trailing /)"
+    [ -z "$GW_KMS" ] || check_value --kms-key-arn "$GW_KMS" '^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$' "a KMS key ARN (arn:aws:kms:<region>:<account>:key/<id>)"
+    [ -z "$GW_NO_PERSON" ] || check_value --no-person-ids "$GW_NO_PERSON" "$GW_ID_LIST" "a comma-separated list of ids"
+    local ant oai
+    ant="$(gw_scope_rule anthropic "$ANT_WS" "$ANT_KEYS" "$ANT_ALL")" || exit $?
+    oai="$(gw_scope_rule openai "$OAI_PROJ" "$OAI_KEYS" "$OAI_ALL")" || exit $?
+    [ -n "$ant$oai" ] || usage_error "a scope is required: which bill lines this gateway may split (--openai-projects, --anthropic-workspaces, --*-keys or --*-all)"
+    local exists; exists="$(gw_get "$STATE_FILE" "GW_SOURCE_$GW_NAME")"
+    [ "$mode" = add ] && [ -n "$exists" ] && die "a gateway source $GW_NAME already exists: use set-gateway-source to change it"
+    [ "$mode" = set ] && [ -z "$exists" ] && die "there is no gateway source $GW_NAME: use add-gateway-source"
+    need_tool aws
+    WORKDIR="$(mktemp -d)"
+    local new name other; new="$(private_file ai-exporter-state)"; cat "$STATE_FILE" > "$new"
+    gw_drop "$new" "$GW_NAME"
+    for name in $(gw_names "$new"); do
+        for p in anthropic openai; do
+            local mine; [ "$p" = anthropic ] && mine="$ant" || mine="$oai"
+            other="$(gw_get "$new" "GW_SCOPE_${name}_$p")"
+            [ -z "$mine" ] || [ -z "$other" ] || ! gw_overlaps "$mine" "$other" \
+                || die "the $p scope of $GW_NAME would overlap the gateway source $name: a bill line may be split by one gateway only"
+        done
+    done
+    local scope="" json
+    [ -z "$ant" ] || scope+="$(gw_scope_json anthropic "$ant")"
+    [ -z "$oai" ] || scope+="${scope:+,}$(gw_scope_json openai "$oai")"
+    json="{\"name\":\"$GW_NAME\",\"type\":\"$GW_TYPE\",\"storage\":\"s3\",\"bucket\":\"$GW_BUCKET\",\"prefix\":\"$GW_PREFIX\",\"scope\":{$scope}"
+    [ -z "$GW_KMS" ] || json+=",\"kms_key_arn\":\"$GW_KMS\""
+    [ -z "$GW_NO_PERSON" ] || json+=",\"no_person_ids\":$(json_list "$GW_NO_PERSON")"
+    json+="}"
+    { echo "GW_SOURCE_$GW_NAME=$json"; echo "GW_BUCKET_$GW_NAME=$GW_BUCKET"; echo "GW_PREFIX_$GW_NAME=$GW_PREFIX"
+      [ -z "$GW_KMS" ] || echo "GW_KMS_$GW_NAME=$GW_KMS"
+      [ -z "$ant" ] || echo "GW_SCOPE_${GW_NAME}_anthropic=$ant"
+      [ -z "$oai" ] || echo "GW_SCOPE_${GW_NAME}_openai=$oai"; } >> "$new"
+    local done_word="added"; [ "$mode" = add ] || done_word="changed"
+    gw_commit "$new" "gateway source $GW_NAME $done_word" "$mode the gateway source $GW_NAME"
+}
+
+cmd_remove_gateway_source() {
+    load_state
+    [ -n "$GW_NAME" ] || usage_error "--name <name> is required"
+    [ -n "$(gw_get "$STATE_FILE" "GW_SOURCE_$GW_NAME")" ] || die "there is no gateway source $GW_NAME (see list-gateway-sources)"
+    need_tool aws
+    WORKDIR="$(mktemp -d)"
+    local new; new="$(private_file ai-exporter-state)"; cat "$STATE_FILE" > "$new"
+    gw_drop "$new" "$GW_NAME"
+    gw_commit "$new" "gateway source $GW_NAME removed (its logs are no longer read; the read access is removed)" \
+        "remove the gateway source $GW_NAME and its read access"
+}
+
+cmd_add_account_map() {
+    load_state
+    [ -n "$(gw_get "$STATE_FILE" "GW_SOURCE_$MAP_SOURCE")" ] || die "--source must name a gateway source (see list-gateway-sources)"
+    [[ "$MAP_PROVIDER" =~ ^(anthropic|openai)$ ]] || usage_error "--provider must be anthropic or openai"
+    [ -n "$MAP_ACCOUNT" ] || usage_error "--account <workspace or project id> is required"
+    check_value --account "$MAP_ACCOUNT" '^[A-Za-z0-9_.:-]+$' "a workspace or project id"
+    local match="" v
+    for v in "model_id:$MAP_MODEL" "api_base:$MAP_API" "key_alias:$MAP_KEY_ALIAS"; do
+        [ -n "${v#*:}" ] || continue
+        check_value "--${v%%:*}" "${v#*:}" '^[A-Za-z0-9_.:/=-]+$' "a LiteLLM deployment id, endpoint or key alias"
+        match+="${match:+,}\"${v%%:*}\":\"$(json_escape "${v#*:}")\""
+    done
+    [ -n "$match" ] || usage_error "give what to match: --model-id, --api-base and/or --key-alias"
+    need_tool aws
+    WORKDIR="$(mktemp -d)"
+    local new; new="$(private_file ai-exporter-state)"; cat "$STATE_FILE" > "$new"
+    echo "GW_MAP={\"source\":\"$MAP_SOURCE\",\"provider\":\"$MAP_PROVIDER\",\"account\":\"$MAP_ACCOUNT\",\"match\":{$match}}" >> "$new"
+    gw_commit "$new" "account map entry added for $MAP_SOURCE" "add an account map entry for $MAP_SOURCE"
+}
+
+cmd_list_gateway_sources() {
+    load_state
+    local name any=false
+    for name in $(gw_names "$STATE_FILE"); do
+        any=true
+        echo "$name: $(gw_get "$STATE_FILE" "GW_SOURCE_$name" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p') logs at s3://$(gw_get "$STATE_FILE" "GW_BUCKET_$name")/$(gw_get "$STATE_FILE" "GW_PREFIX_$name")/"
+        echo "    $(gw_get "$STATE_FILE" "GW_SOURCE_$name")"
+    done
+    $any || { echo "no gateway sources (add one with add-gateway-source)"; return 0; }
+    sed -n 's/^GW_MAP=/    account map: /p' "$STATE_FILE"
 }
 
 # -- commands --------------------------------------------------------------------------------------------------------
@@ -454,6 +675,7 @@ main() {
     case "$cmd" in
         -h|--help|help) usage; exit 0 ;;
         install|upgrade|set-key|run-now|status|uninstall) ;;
+        add-gateway-source|set-gateway-source|remove-gateway-source|add-account-map|list-gateway-sources) ;;
         "") usage; exit 2 ;;
         *) usage_error "unknown command '$cmd'" ;;
     esac
@@ -475,6 +697,24 @@ main() {
             --cloudpi-external-id) need_value "$@"; CLOUDPI_EXTERNAL_ID="$2"; shift 2 ;;
             --expect-sha256) need_value "$@"; EXPECT_SHA="$2"; shift 2 ;;
             --expect-template-sha256) need_value "$@"; EXPECT_TEMPLATE_SHA="$2"; shift 2 ;;
+            --name) need_value "$@"; GW_NAME="$2"; shift 2 ;;
+            --type) need_value "$@"; GW_TYPE="$2"; shift 2 ;;
+            --bucket) need_value "$@"; GW_BUCKET="$2"; shift 2 ;;
+            --prefix) [ $# -ge 2 ] || usage_error "--prefix needs a value"; GW_PREFIX="$2"; shift 2 ;;
+            --kms-key-arn) need_value "$@"; GW_KMS="$2"; shift 2 ;;
+            --no-person-ids) need_value "$@"; GW_NO_PERSON="$2"; shift 2 ;;
+            --anthropic-workspaces) need_value "$@"; ANT_WS="$2"; shift 2 ;;
+            --anthropic-keys) need_value "$@"; ANT_KEYS="$2"; shift 2 ;;
+            --anthropic-all) ANT_ALL=true; shift ;;
+            --openai-projects) need_value "$@"; OAI_PROJ="$2"; shift 2 ;;
+            --openai-keys) need_value "$@"; OAI_KEYS="$2"; shift 2 ;;
+            --openai-all) OAI_ALL=true; shift ;;
+            --source) need_value "$@"; MAP_SOURCE="$2"; shift 2 ;;
+            --provider) need_value "$@"; MAP_PROVIDER="$2"; shift 2 ;;
+            --account) need_value "$@"; MAP_ACCOUNT="$2"; shift 2 ;;
+            --model-id) need_value "$@"; MAP_MODEL="$2"; shift 2 ;;
+            --api-base) need_value "$@"; MAP_API="$2"; shift 2 ;;
+            --key-alias) need_value "$@"; MAP_KEY_ALIAS="$2"; shift 2 ;;
             --dry-run) DRY_RUN=true; shift ;;
             --yes) ASSUME_YES=true; shift ;;
             --delete-data) DELETE_DATA=true; shift ;;
@@ -494,6 +734,11 @@ main() {
         run-now) cmd_run_now ;;
         status) cmd_status ;;
         uninstall) cmd_uninstall ;;
+        add-gateway-source) cmd_gateway_source add ;;
+        set-gateway-source) cmd_gateway_source set ;;
+        remove-gateway-source) cmd_remove_gateway_source ;;
+        add-account-map) cmd_add_account_map ;;
+        list-gateway-sources) cmd_list_gateway_sources ;;
     esac
 }
 
