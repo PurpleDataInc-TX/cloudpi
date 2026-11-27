@@ -1,0 +1,4 @@
+
+# AI billing exporter: per-stack install state (ids only) and downloaded releases
+.cloudpi-ai-exporter*.state
+/ai-exporter/

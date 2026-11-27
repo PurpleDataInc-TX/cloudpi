@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# A stand-in for curl used by test_setup_ai_exporter.sh: "downloads" release files from $FAKE_RELEASE_DIR/<tag>/.
+set -u
+echo "curl $*" >> "$FAKE_AWS_LOG"
+out="" url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    --retry|--retry-delay) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+tag="$(basename "$(dirname "$url")")"
+src="$FAKE_RELEASE_DIR/$tag/$(basename "$url")"
+[ -f "$src" ] || { echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; }
+cp "$src" "$out"

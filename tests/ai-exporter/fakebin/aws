@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# A stand-in for the AWS CLI used by test_setup_ai_exporter.sh. It records every call in $FAKE_AWS_LOG and answers
+# the few reads the installer makes from files under $FAKE_AWS_DIR. Nothing real is touched.
+set -u
+echo "aws $*" >> "$FAKE_AWS_LOG"
+args="$*"
+arg_after() { local want="$1"; shift; while [ $# -gt 0 ]; do [ "$1" = "$want" ] && { echo "${2:-}"; return; }; shift; done; }
+RUN="ai-billing/_runs/20261122T060012Z-3f9a1c2e"
+
+case "$args" in
+  "sts get-caller-identity"*"--query Account"*) echo "123456789012" ;;
+  "sts get-caller-identity"*) echo "arn:aws:iam::123456789012:user/installer" ;;
+  "configure get region"*) echo "us-east-1" ;;
+  "s3api head-bucket"*) [ -f "$FAKE_AWS_DIR/bucket" ] || exit 254 ;;
+  "s3api create-bucket"*) touch "$FAKE_AWS_DIR/bucket" ;;
+  "s3api head-object"*) exit 254 ;;
+  "s3api get-bucket-versioning"*)
+    [ -f "$FAKE_AWS_DIR/versioning-denied" ] && { echo "An error occurred (AccessDenied)" >&2; exit 254; }
+    [ -f "$FAKE_AWS_DIR/versioned" ] && echo "Enabled" || echo "None" ;;
+  "s3api list-objects-v2"*"Contents[].Key"*) printf '%s\t%s\n' "$RUN/anthropic-2026-11.json" "$RUN/openai-2026-11.json" ;;
+  "s3api list-objects-v2"*) echo "$RUN/openai-2026-11.json" ;;
+  "s3 cp s3://"*"anthropic-2026-11.json"*) echo '{"status": "failed", "provider": "anthropic", "month": "2026-11"}' ;;
+  "s3 cp s3://"*" - "*|"s3 cp s3://"*" -") echo '{"status": "ok", "provider": "openai", "month": "2026-11"}' ;;
+  "cloudformation deploy"*)
+    src="$(arg_after --parameter-overrides "$@")"
+    [ "${src#file://}" = "$src" ] || cp "${src#file://}" "$FAKE_AWS_DIR/deploy-params.json"
+    touch "$FAKE_AWS_DIR/stack" ;;
+  "cloudformation describe-stacks"*)
+    [ -f "$FAKE_AWS_DIR/stack" ] || { echo "An error occurred (ValidationError): Stack does not exist" >&2; exit 254; }
+    query="$(arg_after --query "$@")"
+    case "$query" in
+      *"Parameters[].ParameterKey"*)
+        printf 'OrgId\tCodeBucket\tCodeKey\tEnableAnthropic\tEnableOpenAI\tCloudPiExternalId'
+        [ -f "$FAKE_AWS_DIR/no-gateway-params" ] || printf '\tGatewaySources\tGatewayAccountMap\tGatewayLogBucketArns\tGatewayLogObjectArns\tGatewayLogPrefixes\tGatewayKmsKeyArns'
+        echo ;;
+      *StackStatus*) echo "CREATE_COMPLETE" ;;
+      *FunctionName*) echo "cloudpi-ai-exporter-exporter" ;;
+      *AnthropicSecretArn*) [ -f "$FAKE_AWS_DIR/no-anthropic" ] && echo "None" || echo "arn:aws:secretsmanager:us-east-1:123456789012:secret:cloudpi-ai-exporter/anthropic-AbCdEf" ;;
+      *OpenAISecretArn*) echo "arn:aws:secretsmanager:us-east-1:123456789012:secret:cloudpi-ai-exporter/openai-GhIjKl" ;;
+      *OutputBucketName*) echo "cloudpi-ai-focus-123456789012-us-east-1" ;;
+      *OutputPrefix*) echo "ai-billing" ;;
+      *) echo "None" ;;
+    esac ;;
+  "cloudformation update-stack"*)
+    src="$(arg_after --parameters "$@")"
+    cp "${src#file://}" "$FAKE_AWS_DIR/update-params.json"
+    [ -f "$FAKE_AWS_DIR/no-updates" ] && { echo "An error occurred (ValidationError) when calling the UpdateStack operation: No updates are to be performed." >&2; exit 254; }
+    echo "arn:aws:cloudformation:us-east-1:123456789012:stack/cloudpi-ai-exporter/1" ;;
+  "secretsmanager put-secret-value"*)
+    id="$(arg_after --secret-id "$@")"; src="$(arg_after --secret-string "$@")"
+    cp "${src#file://}" "$FAKE_AWS_DIR/secret-${id##*/}"; echo "${src#file://}" > "$FAKE_AWS_DIR/last-key-path" ;;
+  "lambda invoke"*)
+    out="${*: -1}"
+    if [ -f "$FAKE_AWS_DIR/lambda-error" ]; then
+      echo '{"errorMessage": "ConfigError: org_id must be a non-empty string", "errorType": "ConfigError"}' > "$out"
+      [ "$(arg_after --query "$@")" = "FunctionError" ] && echo "Unhandled" || echo '{"StatusCode": 200, "FunctionError": "Unhandled"}'
+    else
+      echo '{"run_id": "20261122T060012Z-3f9a1c2e", "dry_run": true, "tasks": [{"provider": "anthropic", "month": "2026-11", "reason": "current"}]}' > "$out"
+      [ "$(arg_after --query "$@")" = "FunctionError" ] && echo "None" || echo '{"StatusCode": 200}'
+    fi ;;
+  *) : ;;
+esac
+exit 0
