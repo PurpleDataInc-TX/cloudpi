@@ -381,6 +381,15 @@ t_account_map_entries() {
   expect "its map goes with it" up_has '"ParameterKey":"GatewayAccountMap","ParameterValue":"[]"'
 }
 
+t_set_gateway_source_keeps_its_account_map() {  # found in the real-bill lab 2026-11-27
+  install_ok && add_gw --openai-projects proj_a
+  run add-account-map --source litellm-prod --provider openai --account proj_a --model-id openai-proj-a
+  run set-gateway-source --name litellm-prod --type litellm --bucket acme-litellm-logs --prefix gateway-logs --openai-projects proj_a,proj_b
+  expect "set ($OUT)" [ "$CODE" -eq 0 ] && expect "new scope" up_has 'proj_b' &&
+  expect "the map is kept" up_has '"ParameterKey":"GatewayAccountMap","ParameterValue":"[{\"source\":\"litellm-prod\"' &&
+  expect "still in the state" grep -q '^GW_MAP={"source":"litellm-prod"' "$AI_EXPORTER_STATE"
+}
+
 t_list_gateway_sources() {
   install_ok && add_gw --openai-projects proj_9xY
   run list-gateway-sources

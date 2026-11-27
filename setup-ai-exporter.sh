@@ -365,10 +365,12 @@ gw_overlaps() {  # gw_overlaps <rule a> <rule b>: true when two scopes of one pr
 
 gw_get() { sed -n "s/^$2=//p" "$1" | head -n 1; }  # gw_get <state file> <key>
 gw_names() { sed -n 's/^GW_SOURCE_\([a-z0-9-]*\)=.*/\1/p' "$1"; }
-gw_drop() {  # gw_drop <state file> <name>: forget a source and its account-map entries
-    local tmp; tmp="$(private_file ai-exporter-state)"
+gw_drop() {  # gw_drop <state file> <name> [keep-map]: forget a source and (unless keep-map) its account-map entries
+    local tmp map_rule="^GW_MAP={\"source\":\"$2\","
+    [ "${3:-}" != keep-map ] || map_rule="^GW_SOURCE_$2="   # a pattern already dropped: every GW_MAP line stays
+    tmp="$(private_file ai-exporter-state)"
     grep -v -e "^GW_SOURCE_$2=" -e "^GW_BUCKET_$2=" -e "^GW_PREFIX_$2=" -e "^GW_KMS_$2=" -e "^GW_SCOPE_$2_" \
-        -e "^GW_MAP={\"source\":\"$2\"," "$1" > "$tmp" || true
+        -e "$map_rule" "$1" > "$tmp" || true
     cat "$tmp" > "$1"; rm -f "$tmp"
 }
 
@@ -458,7 +460,7 @@ cmd_gateway_source() {  # add-gateway-source / set-gateway-source
     need_tool aws
     WORKDIR="$(mktemp -d)"
     local new name other; new="$(private_file ai-exporter-state)"; cat "$STATE_FILE" > "$new"
-    gw_drop "$new" "$GW_NAME"
+    gw_drop "$new" "$GW_NAME" keep-map   # changing a source keeps its account map; remove-gateway-source drops it
     for name in $(gw_names "$new"); do
         for p in anthropic openai; do
             local mine; [ "$p" = anthropic ] && mine="$ant" || mine="$oai"
